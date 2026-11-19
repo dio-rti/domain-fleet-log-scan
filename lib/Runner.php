@@ -375,13 +375,36 @@ final class Runner
     {
         $always = !empty($this->opt['webhook_always']);
         $dry = !empty($this->opt['dry_run']) || !empty($this->opt['webhook_dry_run']);
-        if (!$changed && !$always) {
+        $iris = !empty($this->opt['iris_publish']);
+        if (!$changed && !$always && !IrisPublish::postsOnQuietDay($iris)) {
             return 'not sent (quiet day)';
         }
         $wh = Webhook::fromEnvFile($this->cfg['webhook_env']);
-        $payload = Webhook::payload($run);
+        if ($iris) {
+            $sgFile = $this->opt['iris_sg'] ?? null;
+            if (is_string($sgFile) && is_file($sgFile) && is_readable($sgFile)) {
+                $sg = json_decode((string)file_get_contents($sgFile), true);
+                if (is_array($sg)) {
+                    $this->say('iris sg: loaded');
+                    $payload = IrisPublish::augment($sg);
+                } else {
+                    $this->say('iris sg: absent');
+                    $payload = IrisPublish::fromRun($run, $this->opt, $this->fixtures() !== null ? $this->now : time());
+                }
+            } else {
+                $this->say('iris sg: absent');
+                $payload = IrisPublish::fromRun($run, $this->opt, $this->fixtures() !== null ? $this->now : time());
+            }
+            if (IrisPublish::dropped() > 0) {
+                $this->say('iris publish: ' . IrisPublish::dropped() . ' field(s) dropped by tripwire');
+            }
+            $label = 'iris ingest v1';
+        } else {
+            $payload = Webhook::payload($run);
+            $label = 'webhook';
+        }
         if ($dry) {
-            $this->say('webhook dry-run payload (not sent' . ($wh->enabled() ? '' : '; ' . $wh->disabledReason) . '):');
+            $this->say($label . ' dry-run payload (not sent' . ($wh->enabled() ? '' : '; ' . $wh->disabledReason) . '):');
             $this->say(json_encode($payload, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE));
             return 'dry-run (printed, not sent)';
         }
