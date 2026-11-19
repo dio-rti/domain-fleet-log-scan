@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  TEMPLATE ONLY. Not loaded. Do not copy into ~/Library/LaunchAgents and do not launchctl load it
+  until Dio gives a standing OK for the read-only daily scan. state/DISABLED is also present.
+  StartCalendarInterval uses the iMac's local clock, which is Asia/Dubai: Hour=7 means 07:00 Dubai
+  (11:00 Asia/Manila). Dio's override (2026-11-13): 07:00 Asia/Dubai.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.rti.fleet-log-scan</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/opt/homebrew/bin/php</string>
+    <string>/Users/diorti/.openclaw/workspace-abella/tools/fleet-log-scan/fleet-log-scan.php</string>
+    <string>--daily</string>
+  </array>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key>
+    <integer>7</integer>
+    <key>Minute</key>
+    <integer>0</integer>
+  </dict>
+  <key>Umask</key>
+  <integer>63</integer>
+  <key>StandardOutPath</key>
+  <string>/Users/diorti/.openclaw/workspace-abella/tools/fleet-log-scan/reports/launchd.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/diorti/.openclaw/workspace-abella/tools/fleet-log-scan/reports/launchd.err.log</string>
+  <key>RunAtLoad</key>
+  <false/>
+</dict>
+</plist>
