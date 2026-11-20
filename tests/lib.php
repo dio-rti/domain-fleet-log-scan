@@ -5,7 +5,7 @@ declare(strict_types=1);
 
 const PHP_BIN = '/opt/homebrew/bin/php';
 define('TOOL', dirname(__DIR__));
-foreach (['Util', 'Redact', 'Config', 'Payload', 'Sites', 'Pool', 'Tsv', 'State', 'Diff', 'Outputs', 'IrisPatterns', 'IrisPublish', 'Runner'] as $f) {
+foreach (['Util', 'Redact', 'Config', 'Payload', 'Sites', 'Pool', 'Tsv', 'State', 'Diff', 'Outputs', 'IrisPatterns', 'IrisPublish', 'SummaryNumberTrace', 'IrisSummaryVerifier', 'IrisSummary', 'Runner'] as $f) {
     require_once TOOL . '/lib/' . $f . '.php';
 }
 

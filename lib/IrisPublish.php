@@ -339,9 +339,9 @@ final class IrisPublish
     }
 
     /** Write the final document once. A later call returns those bytes. */
-    public static function remember(string $path, array $doc): array
+    public static function remember(string $path, array $doc, bool $replace = false): array
     {
-        if (is_file($path)) {
+        if (!$replace && is_file($path)) {
             $saved = json_decode((string)file_get_contents($path), true);
             if (is_array($saved)) {
                 return $saved;
@@ -489,4 +489,57 @@ final class IrisPublish
         unset($doc['payload_hash']);
         return hash('sha256', self::canonical($doc));
     }
+
+    /** A summary 422 is the only failure that is posted again, once, as skipped. */
+    public static function summaryRejected(array $result): bool
+    {
+        if ((int)($result['code'] ?? 0) !== 422) {
+            return false;
+        }
+        $body = $result['body'] ?? '';
+        $json = is_array($body) ? $body : json_decode((string)$body, true);
+        if (!is_array($json)) {
+            return false;
+        }
+        $violations = $json['violations'] ?? [];
+        if (!is_array($violations)) {
+            return false;
+        }
+        foreach ($violations as $v) {
+            if (!is_array($v)) {
+                continue;
+            }
+            $ptr = (string)($v['pointer'] ?? '');
+            $rule = (string)($v['rule'] ?? $v['class'] ?? '');
+            if (str_starts_with($ptr, '/ai_summary') || $rule === 'summary_untraced') {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    public static function asSkipped(array $doc): array
+    {
+        $doc['ai_summary'] = ['status' => 'skipped', 'text' => null, 'model' => null];
+        if (!isset($doc['safety']) || !is_array($doc['safety'])) {
+            $doc['safety'] = [];
+        }
+        $doc['safety']['summary_model_used'] = false;
+        unset($doc['payload_hash']);
+        $doc['payload_hash'] = self::hash($doc);
+        return $doc;
+    }
+
+    /** @param callable(array): array{code:int,body:mixed} $client */
+    public static function deliver(string $path, array $doc, callable $client): array
+    {
+        $sent = self::remember($path, $doc);
+        $first = $client($sent);
+        if (!self::summaryRejected($first)) {
+            return ['posts' => 1, 'result' => $first, 'doc' => $sent];
+        }
+        $sent = self::remember($path, self::asSkipped($sent), true);
+        return ['posts' => 2, 'result' => $client($sent), 'doc' => $sent];
+    }
 }
+

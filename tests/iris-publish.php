@@ -3,11 +3,13 @@ declare(strict_types=1);
 
 // Standalone: no network, no fixtures logs. Prints only "iris-publish tests: N passed".
 define('TOOL', dirname(__DIR__));
-foreach (['Util', 'Redact', 'Config', 'Payload', 'Sites', 'Pool', 'Tsv', 'State', 'Diff', 'Outputs', 'IrisPatterns', 'IrisPublish', 'Runner'] as $f) {
+foreach (['Util', 'Redact', 'Config', 'Payload', 'Sites', 'Pool', 'Tsv', 'State', 'Diff', 'Outputs', 'IrisPatterns', 'IrisPublish', 'SummaryNumberTrace', 'IrisSummaryVerifier', 'IrisSummary', 'Runner'] as $f) {
     require_once TOOL . '/lib/' . $f . '.php';
 }
 
 use Fls\IrisPublish;
+use Fls\IrisSummary;
+use Fls\SummaryNumberTrace;
 
 $pass = 0;
 $fail = 0;
@@ -176,6 +178,115 @@ $t($frozen['payload_hash'] === $s['payload_hash'] && $kept['schema_version'] ===
 
 $fixture = json_decode((string)file_get_contents(TOOL . '/tests/fixtures/iris-summary-sg.json'), true);
 $t(is_array($fixture) && ($fixture['timing']['timezone_note'] ?? '') === 'Human clock is Asia/Manila.', 'shared SG fixture keeps the source clock');
+
+$vectors = json_decode((string)file_get_contents(TOOL . '/tests/fixtures/summary-number-trace-vectors.json'), true);
+$vectorOk = true;
+foreach ($vectors['cases'] as $case) {
+    $bad = SummaryNumberTrace::firstUntraced($case['text'], $case['doc']);
+    if ($case['ok'] ? $bad !== null : $bad === null) {
+        $vectorOk = false;
+    }
+}
+$t($vectorOk, 'shared number-trace vectors');
+$t(SummaryNumberTrace::displayZone(['timing' => ['timezone_note' => 'Human clock is NotA/Zone.']])->getName() === 'Asia/Dubai', 'display zone falls back to Dubai');
+$t(SummaryNumberTrace::displayZone(['timing' => ['timezone_note' => 'Human clock is Asia/Manila.']])->getName() === 'Asia/Manila', 'source note still selects Manila');
+$t(IrisSummary::enabled(['iris_summary' => true]) === false && IrisSummary::enabled(['iris_summary' => true, 'iris_publish' => true]) === true, 'summary flag needs publish');
+$t(str_contains($help, '--iris-summary'), 'help mentions --iris-summary');
+$alone = (string)shell_exec(escapeshellarg(PHP_BINARY) . ' ' . escapeshellarg(TOOL . '/fleet-log-scan.php') . ' --daily --iris-summary 2>&1');
+$t(str_contains($alone, '--iris-summary is only allowed with --iris-publish'), 'summary flag refused without publish');
+
+$base = IrisPublish::fromRun([
+    'run_id' => '20261119T101500-abc123', 'mode' => 'daily', 'started' => 1795140900, 'servers' => 1,
+    'flags' => [], 'failures' => [], 'summary_status' => 'summary ok',
+], [], 1795141000);
+$clean = "The SG log scan is done.\n\nWhat stands out:\n- a quiet fleet\n\nQuiet logs: none reported.\n\nMissing from this scan: there were no PHP fatals.\n\nMost urgent: none recorded.";
+$seenArgv = null;
+$seenCwd = null;
+$calls = 0;
+$runner = static function (array $argv, string $cwd) use (&$seenArgv, &$seenCwd, &$calls, $clean): array {
+    $calls++;
+    $seenArgv = $argv;
+    $seenCwd = $cwd;
+    $empty = array_diff(scandir($cwd) ?: [], ['.', '..']) === [];
+    if (!$empty || !str_starts_with(basename($cwd), 'fls-iris-')) {
+        return ['exit' => 1, 'stdout' => '', 'timedOut' => false];
+    }
+    return ['exit' => 0, 'stdout' => $clean, 'timedOut' => false];
+};
+$attached = IrisSummary::attach($base, ['runner' => $runner]);
+$argv = $attached['argv'] ?? [];
+$exact = ($argv[0] ?? '') === 'cursor-agent' && ($argv[1] ?? '') === '-p' && ($argv[2] ?? '') === '--model'
+    && ($argv[3] ?? '') === 'grok-4.7-high' && ($argv[4] ?? '') === '--trust' && ($argv[5] ?? '') === '--force'
+    && ($argv[6] ?? '') === '--mode' && ($argv[7] ?? '') === 'ask' && ($argv[8] ?? '') === '--output-format'
+    && ($argv[9] ?? '') === 'text' && is_string($argv[10] ?? null);
+$joined = implode("\n", $argv);
+$t($calls === 1 && $exact && !str_contains($joined, 'yolo') && !str_contains($joined, '-fast'), 'summary argv is grok-4.7-high ask text');
+$t(is_string($seenCwd) && !is_dir($seenCwd), 'summary temp dir is removed');
+$t(($attached['doc']['ai_summary']['status'] ?? '') === 'ok' && ($attached['doc']['ai_summary']['model'] ?? '') === 'grok-4.7-high' && ($attached['doc']['safety']['summary_model_used'] ?? false) === true, 'verified text is attached');
+$t(!str_contains((string)($argv[10] ?? ''), 'payload_hash') && str_contains((string)($argv[10] ?? ''), 'Asia/Manila'), 'prompt embeds the document without the hash');
+
+$skipCase = static function (array $ran) use ($base): array {
+    return IrisSummary::attach($base, ['runner' => static fn(array $argv, string $cwd): array => $ran]);
+};
+$t($skipCase(['exit' => 0, 'stdout' => '', 'timedOut' => false])['reason'] === 'empty', 'empty summary is skipped');
+$t($skipCase(['exit' => 0, 'stdout' => $clean, 'timedOut' => true])['reason'] === 'timeout', 'timed out summary is skipped');
+$missing = IrisSummary::attach($base, ['bin' => '/tmp/fls-no-such-cursor-agent']);
+$t($missing['reason'] === 'missing-cli' && $missing['argv'] === null, 'missing CLI is skipped without a call');
+$untraced = $skipCase(['exit' => 0, 'stdout' => $clean . "\n\nCounted 99999 items.", 'timedOut' => false]);
+$t($untraced['reason'] === 'summary_untraced' && ($untraced['doc']['ai_summary']['text'] === null) && ($untraced['doc']['safety']['summary_model_used'] ?? true) === false, 'untraced number is skipped');
+$quad = implode('.', ['203', '0', '113', '10']);
+$ip = $skipCase(['exit' => 0, 'stdout' => $clean . "\n\nAddress " . $quad . " was seen.", 'timedOut' => false]);
+$t($ip['reason'] === 'ipv4' && ($ip['doc']['ai_summary']['text'] === null), 'ip text is skipped');
+$home = $skipCase(['exit' => 0, 'stdout' => $clean . "\n\nSee /home/scan for the note.", 'timedOut' => false]);
+$t($home['reason'] === 'path', 'home path text is skipped');
+$dirty = $base;
+$dirty['note'] = 'seen ' . $quad;
+$blocked = IrisSummary::attach($dirty, ['runner' => static function () use (&$calls) {
+    $calls++;
+    return ['exit' => 0, 'stdout' => '', 'timedOut' => false];
+}]);
+$t($blocked['reason'] === 'tripwire' && $blocked['argv'] === null, 'prompt tripwire skips the model');
+$huge = $base;
+$huge['note'] = str_repeat('a', 270000);
+$tooBig = IrisSummary::attach($huge, ['runner' => static function () use (&$calls) {
+    $calls++;
+    return ['exit' => 0, 'stdout' => $clean, 'timedOut' => false];
+}]);
+$t($tooBig['reason'] === 'prompt-too-large' && $tooBig['argv'] === null, 'oversized prompt skips the model');
+
+$logDir = sys_get_temp_dir() . '/fls-iris-log-' . getmypid();
+mkdir($logDir, 0700);
+$logged = IrisSummary::attach($base, [
+    'runner' => static fn(): array => ['exit' => 0, 'stdout' => '', 'timedOut' => false],
+    'log' => $logDir . '/summary.log',
+]);
+$t($logged['reason'] === 'empty' && trim((string)file_get_contents($logDir . '/summary.log')) === 'empty', 'skip reason stays in the local log');
+@unlink($logDir . '/summary.log');
+@rmdir($logDir);
+
+$withOk = $attached['doc'];
+$postDir = sys_get_temp_dir() . '/fls-iris-post-' . getmypid();
+mkdir($postDir, 0700);
+$posts = [];
+$client = static function (array $doc) use (&$posts): array {
+    $posts[] = $doc;
+    if (count($posts) === 1) {
+        return ['code' => 422, 'body' => json_encode(['violations' => [['pointer' => '/ai_summary/text', 'rule' => 'summary_untraced']]])];
+    }
+    return ['code' => 201, 'body' => ''];
+};
+$delivered = IrisPublish::deliver($postDir . '/one.iris.json', $withOk, $client);
+$t(count($posts) === 2 && $delivered['result']['code'] === 201, 'summary 422 is posted once more');
+$t(($posts[1]['ai_summary']['status'] ?? '') === 'skipped' && ($posts[1]['ai_summary']['text'] === null) && ($posts[1]['safety']['summary_model_used'] ?? true) === false, 'the retry is skipped with the flag off');
+$other = [];
+IrisPublish::deliver($postDir . '/two.iris.json', $withOk, static function (array $doc) use (&$other): array {
+    $other[] = $doc;
+    return ['code' => 422, 'body' => json_encode(['violations' => [['pointer' => '/sites/0', 'rule' => 'unknown_site']]])];
+});
+$t(count($other) === 1, 'a non-summary 422 is not retried');
+@unlink($postDir . '/one.iris.json');
+@unlink($postDir . '/two.iris.json');
+@rmdir($postDir);
 
 if ($fail) {
     exit(1);

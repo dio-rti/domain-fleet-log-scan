@@ -421,10 +421,27 @@ final class Runner
             return 'webhook not sent: fixtures mode only posts to a loopback URL';
         }
         if ($iris) {
+            if (!empty($this->opt['iris_summary'])) {
+                $attached = IrisSummary::attach($payload, [
+                    'log' => $this->cfg['data_dir'] . '/reports/' . $this->runId . '.iris-summary.log',
+                ]);
+                $payload = $attached['doc'];
+                if ($attached['reason'] !== null) {
+                    $this->say('iris summary: skipped');
+                }
+            }
             $safe = preg_replace('/[^0-9A-Za-zT_-]/', '', (string)($payload['job']['run_id'] ?? $run['run_id']));
-            $payload = IrisPublish::remember($this->cfg['data_dir'] . '/reports/' . $safe . '.iris.json', $payload);
+            $path = $this->cfg['data_dir'] . '/reports/' . $safe . '.iris.json';
+            $payload = IrisPublish::remember($path, $payload);
+            $res = $wh->postResult($payload);
+            if (IrisPublish::summaryRejected($res)) {
+                $payload = IrisPublish::remember($path, IrisPublish::asSkipped($payload), true);
+                $res = $wh->postResult($payload);
+            }
+            $st = $wh->mask($res['status']);
+        } else {
+            $st = $wh->mask($wh->post($payload));
         }
-        $st = $wh->mask($wh->post($payload));
         $this->say($st);
         return $st;
     }
