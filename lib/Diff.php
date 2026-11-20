@@ -11,30 +11,59 @@ final class Diff
         return hash('sha256', $level . "\x1f" . $category . "\x1f" . $template);
     }
 
+    /**
+     * Fatal means a fatal level, a PHP fatal, a ParseError, memory exhaustion, an uncaught exception or an HTTP 5xx.
+     * ErrorException with E_ERROR/E_PARSE/E_COMPILE_ERROR/E_RECOVERABLE_ERROR (1, 4, 64, 256) matches only while the
+     * category still carries its digits; templates normalized to ErrorException:{n} cannot be told apart, so they stay
+     * non-fatal. A plain error, undefined index/key and "Fork child failed" are not fatal.
+     */
     public static function isFatal(string $level, string $category, string $template): bool
     {
-        return $level === 'error'
-            || (bool)preg_match('/fatal|uncaught|HttpException:5\d\d|\bhttp_status\W*5\d\d|(?<!\.php:)\b5\d\d\b/i', $category . ' ' . $template);
+        return $level === 'fatal'
+            || (bool)preg_match('/(?<![\w-])fatal(?:error|throwable|\b)|\buncaught\b|HttpException:5\d\d|\bhttp_status\W*5\d\d|\bParseError\b|Allowed memory size|ErrorException:(?:1|4|64|256)\b(?!\d)/i', $category . ' ' . $template);
+    }
+
+    /** A role is on its version baseline until a run with the current normalizer version recorded it. */
+    public static function roleOnBaseline(array $history, string $role): bool
+    {
+        foreach ($history['runs'] ?? [] as $r) {
+            if (($r['normalizer_version'] ?? null) === Family::VERSION && isset($r['roles'][$role])) {
+                return false;
+            }
+        }
+        return true;
     }
 
     /**
-     * @param array $observed list of {role, class, key, level, category, template, count, hours}
+     * @param array $observed list of {role, class, key, level, category, template, count, hours[, raw_template]}
+     * @param ?list<string> $roles roles read this run (so a quiet role still counts); default: roles in $observed
      * @return array{flags: array, baseline: bool, historyDays: int}
      */
-    public static function evaluate(string $site, array $history, array $observed, int $now, array $cfg, KnownHarmless $kh): array
+    public static function evaluate(string $site, array $history, array $observed, int $now, array $cfg, KnownHarmless $kh, ?array $roles = null): array
     {
         $d = $cfg['diff'];
         $hdays = GroupHistory::historyDays($history, $now, (int)$d['history_days']);
-        $baseline = $hdays === 0 && !$history['runs'];
         $flags = [];
-        if ($baseline) {
+        if ($hdays === 0 && !$history['runs']) {
             return ['flags' => [], 'baseline' => true, 'historyDays' => 0];
         }
+        $seenRoles = array_map('strval', $roles ?? []);
         foreach ($observed as $o) {
+            $seenRoles[] = (string)$o['role'];
+        }
+        $onBase = [];
+        foreach (array_unique($seenRoles) as $role) {
+            $onBase[$role] = self::roleOnBaseline($history, $role);
+        }
+        $baseline = $onBase && !in_array(false, $onBase, true);
+        foreach ($observed as $o) {
+            if ($onBase[(string)$o['role']] ?? false) {
+                continue; // no current-version history for this role: it only records this run
+            }
             $id = $o['role'] . '|' . $o['key'];
             $g = $history['groups'][$id] ?? null;
             $seen = $g !== null && (int)($g['last_seen'] ?? 0) >= $now - (int)$d['history_days'] * 86400;
-            $harmless = $kh->match($site, $o['class'], $o['level'], $o['category'], $o['template']);
+            $harmless = $kh->match($site, $o['class'], $o['level'], $o['category'], (string)($o['raw_template'] ?? $o['template']));
             $rate = $o['count'] / max(1.0, (float)$o['hours']);
             if (!$seen) {
                 if ($harmless !== null) {
@@ -56,7 +85,7 @@ final class Diff
                 $flags[] = $o + ['site' => $site, 'flag' => 'spike', 'rate' => $rate, 'usual' => $med * max(1.0, (float)$o['hours']), 'factor' => $factor, 'harmless' => $harmless];
             }
         }
-        return ['flags' => $flags, 'baseline' => false, 'historyDays' => $hdays];
+        return ['flags' => $flags, 'baseline' => $baseline, 'historyDays' => $hdays];
     }
 }
 

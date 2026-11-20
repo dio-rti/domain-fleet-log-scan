@@ -3,7 +3,7 @@ declare(strict_types=1);
 
 // Standalone: no network, no fixtures logs. Prints only "iris-publish tests: N passed".
 define('TOOL', dirname(__DIR__));
-foreach (['Util', 'Redact', 'Config', 'Payload', 'Sites', 'Pool', 'Tsv', 'State', 'Diff', 'Outputs', 'IrisPatterns', 'IrisPublish', 'SummaryNumberTrace', 'IrisSummaryVerifier', 'IrisSummary', 'Runner'] as $f) {
+foreach (['Util', 'Redact', 'Config', 'Payload', 'Sites', 'Pool', 'Tsv', 'State', 'Family', 'Diff', 'Outputs', 'IrisPatterns', 'IrisPublish', 'SummaryNumberTrace', 'IrisSummaryVerifier', 'IrisSummary', 'Runner'] as $f) {
     require_once TOOL . '/lib/' . $f . '.php';
 }
 
@@ -124,7 +124,7 @@ $t($s['safety']['summary_model_used'] === false, 'digest summary ok does not mar
 $t($s['timing']['timezone_note'] === 'Human clock is Asia/Manila.', 'timezone note stays Manila');
 $t($s['scope']['window']['hours'] === 24 && $s['config']['connect_timeout_seconds'] === 15 && $s['config']['total_timeout_seconds'] === 120, 'window and timeouts filled');
 $gap = $s['coverage_gaps'][0];
-$t($gap['type'] === 'timeout' && $gap['note'] === 'Same problem as 30000/db.' && $gap['roles'] === ['11050/db', '11100/db'], 'db timeout gap uses the pattern');
+$t($gap['type'] === 'timeout' && $gap['note'] === 'Read timed out on 11050/db, 11100/db.' && $gap['roles'] === ['11050/db', '11100/db'], 'db timeout gap note is the site/role list');
 $db = null;
 foreach ($s['sites'] as $site) {
     foreach ($site['roles'] as $role) {
@@ -157,7 +157,7 @@ foreach ($s['urgent'] as $u) {
 }
 $t($refused !== null && $refused['count'] === 11 && ($refused['breakdown']['11080']['db'] ?? 0) === 9 && ($refused['breakdown']['11090']['admin'] ?? 0) === 2, 'breakdown sums the signature');
 $siteIds = array_column($s['sites'], 'site_id');
-$t(!in_array('30000', $siteIds, true) && $s['suggested_fixes'] === [], 'pattern text is not a site id');
+$t(!in_array('30000', $siteIds, true) && $s['suggested_fixes'] !== [], 'no 30000 site id; urgent rows give fixes');
 
 $adminTimeout = [
     'run_id' => '20261119T101500-abc123', 'mode' => 'daily', 'started' => 1795140900, 'servers' => 1,
@@ -438,6 +438,139 @@ $ovNote = (string)($ovDoc['result']['flagged_note'] ?? '');
 $t(substr_count($ovNote, 'Iris caps:') === 1 && str_contains($ovNote, 'dropped') && str_contains($ovNote, 'roles'), 'oversized sites: one note, counts roles');
 $t($ovDoc['job'] === $ov['job'] && $ovDoc['timing'] === $ov['timing'], 'oversized sites: job and timing untouched');
 
+// ---------------------------------------------------------------- replay of saved reports (read-only, counts only)
+$replayRead = static function (string $rid): ?array {
+    $path = TOOL . '/reports/' . $rid . '.txt';
+    if (!is_file($path)) {
+        return null;
+    }
+    $started = (int)\DateTimeImmutable::createFromFormat('Ymd\THis\Z', substr($rid, 0, 16), new \DateTimeZone('UTC'))->getTimestamp();
+    $sec = '';
+    $run = ['run_id' => $rid, 'mode' => 'daily', 'started' => $started, 'flags' => [], 'failures' => [], 'scans' => [], 'notes' => [], 'quiet' => []];
+    $table = [];
+    foreach (preg_split('/\r?\n/', (string)file_get_contents($path)) as $line) {
+        if (str_starts_with($line, '## Servers')) {
+            $sec = 'servers';
+            continue;
+        }
+        if (str_starts_with($line, '## Flags, failures')) {
+            $sec = 'flags';
+            continue;
+        }
+        if (str_starts_with($line, 'groups (redacted templates)')) {
+            $sec = 'table';
+            continue;
+        }
+        if ($line === '' || str_starts_with($line, 'delivery ')) {
+            $sec = $sec === 'table' && $line === '' ? '' : ($line === '' ? '' : $sec);
+            continue;
+        }
+        if ($sec === 'servers' && preg_match('/^  (\d{5})\/(\S+)\s+(\S+)\s+([0-9.]+)s$/', $line, $m)) {
+            $run['scans'][] = ['site' => $m[1], 'role' => $m[2], 'status' => $m[3], 'duration' => (float)$m[4], 'checkpoint_saved' => $m[3] === 'ok'];
+        } elseif ($sec === 'flags') {
+            if (preg_match('/^  (\d{5}) (\S+) (new-fatal|new|spike) (\S+) (\S*) "(.*)" count (\d+)$/', $line, $m)) {
+                $run['flags'][] = ['site' => $m[1], 'role' => $m[2], 'flag' => $m[3], 'level' => $m[4], 'category' => $m[5], 'template' => $m[6], 'count' => (int)$m[7]];
+            } elseif (preg_match('/^  (\S+) (\S+) FAILED (.+)$/', $line, $m)) {
+                $run['failures'][] = ['site' => $m[1], 'role' => $m[2], 'status' => $m[3]];
+            } elseif (preg_match('/ capped: newest \d+ MB read, [0-9.]+ MB skipped$/', $line)) {
+                $run['notes'][] = trim($line);
+            }
+        } elseif ($sec === 'table' && preg_match('/^  (\d{5}) (\S+)\s+(\S+)\s+(\d+)\s+(\S*) "(.*)"$/', $line, $m)) {
+            $table[] = ['site' => $m[1], 'role' => $m[2], 'level' => $m[3], 'count' => (int)$m[4], 'category' => $m[5], 'template' => $m[6]];
+        }
+    }
+    $run['servers'] = count($run['scans']);
+    $durMax = $run['scans'] ? (int)ceil(max(array_column($run['scans'], 'duration'))) : 0;
+    return ['run' => $run, 'table' => $table, 'now' => $started + $durMax + 5, 'capped' => count($run['notes'])];
+};
+$replays = [
+    ['20261120T082008Z-f3eaa0af', 'sg', 30],
+    ['20261120T095002Z-b0e2308a', 'vertex', 25],
+    ['20261120T094624Z-1428fce0', 'sg-live', 5],
+    ['20261120T094147Z-0c611166', 'jp', 60],
+];
+$jpIds = ['10030', '10531', '10541', '10681', '10684', '10687'];
+$replaySkipped = 0;
+$replayChecksEach = 8; // assertions per replay (JP has two more)
+foreach ($replays as [$rid, $label, $maxFamilies]) {
+    // reports/ is gitignored and fleet-reporter is a sibling checkout: absent means skip, present is asserted fully.
+    $in = $haveAutoload ? $replayRead($rid) : null;
+    if ($in === null) {
+        $replaySkipped += $replayChecksEach + ($label === 'jp' ? 2 : 0);
+        continue;
+    }
+    $doc = IrisPublish::fromRun($in['run'], [], $in['now']);
+    $stats = IrisPublish::capStats();
+    $sigs = $doc['top_signatures'];
+    $mix = ['critical' => 0, 'high' => 0, 'medium' => 0, 'low' => 0, 'noise' => 0];
+    foreach ($sigs as $s) {
+        $mix[$s['severity']] = ($mix[$s['severity']] ?? 0) + 1;
+    }
+    $families = count($sigs);
+    if ($label === 'jp') {
+        $keys = [];
+        foreach ($in['table'] as $r) {
+            $keys[$r['level'] . "\n" . \Fls\Family::normalize($r['template'])] = true;
+        }
+        $t(count($keys) > 0 && count($keys) <= $maxFamilies, "replay $label: group-table families " . count($keys) . " <= $maxFamilies");
+    }
+    $t($families > 0 && $families <= $maxFamilies, "replay $label: flag families $families <= $maxFamilies");
+    $t(($stats['kept']['top_signatures'] ?? -1) === ($stats['orig']['top_signatures'] ?? -2) && !str_contains((string)($doc['result']['flagged_note'] ?? ''), 'signatures'), "replay $label: top_signatures not cut by the cap");
+    $rows = [];
+    foreach ($doc['sites'] as $site) {
+        foreach ($site['roles'] as $role) {
+            $rows[$site['site_id'] . '/' . $role['role']] = $role;
+        }
+    }
+    $mismatch = 0;
+    foreach ($in['run']['scans'] as $sc) {
+        $row = $rows[$sc['site'] . '/' . $sc['role']] ?? null;
+        if ($row === null || abs((float)$row['duration_seconds'] - $sc['duration']) > 0.05) {
+            $mismatch++;
+        }
+    }
+    $t($mismatch === 0, "replay $label: role-row duration mismatches $mismatch");
+    $noRoleDash = 0;
+    foreach ($doc['sites'] as $site) {
+        foreach ($site['roles'] as $role) {
+            $noRoleDash += $role['role'] === '-' ? 1 : 0;
+        }
+    }
+    $t($noRoleDash === 0, "replay $label: no role row for role -");
+    $byteGaps = array_values(array_filter($doc['coverage_gaps'], fn($g) => ($g['type'] ?? '') === 'byte_cap'));
+    $withSite = count(array_filter($byteGaps, fn($g) => preg_match('/\b\d{5}\b/', (string)($g['note'] ?? '') . ' ' . implode(' ', $g['roles'] ?? [])) === 1 && isset($g['cap_mb_per_file'])));
+    $t(count($byteGaps) === $in['capped'] && $withSite === count($byteGaps), "replay $label: byte_cap gaps " . count($byteGaps) . " of {$in['capped']} capped notes");
+    $failIds = 0;
+    foreach ($in['run']['failures'] as $f) {
+        $inTitle = count(array_filter($doc['urgent'], fn($u) => str_contains($u['title'], $f['site'])));
+        $failIds += $inTitle > 0 ? 0 : 1;
+    }
+    $t($failIds === 0, "replay $label: failures without the site id in an urgent title $failIds");
+    $t(!$doc['urgent'] || count($doc['suggested_fixes']) > 0, "replay $label: urgent rows have fixes");
+    if ($label === 'jp') {
+        $inGaps = count(array_filter($jpIds, fn($id) => count(array_filter($doc['coverage_gaps'], fn($g) => ($g['type'] ?? '') === 'visibility' && str_contains((string)($g['note'] ?? ''), $id))) > 0));
+        $t($inGaps === count($jpIds), "replay $label: JP ids in visibility gap notes $inGaps of " . count($jpIds));
+    }
+    $viol = 0;
+    $hashOk = false;
+    $bodyOk = false;
+    if ($haveAutoload) {
+        $obj = json_decode((string)json_encode($doc, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE));
+        $viol = count((new \app\services\SchemaValidator())->validate($obj)) + count((new \app\support\Redactor())->scan($obj));
+        $hashOk = \app\support\Canonical::hash($obj) === $doc['payload_hash'];
+        $bodyOk = strlen((string)json_encode($doc, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE)) < 1048576;
+    }
+    $t($viol === 0 && $hashOk && $bodyOk, "replay $label: violations $viol, hash " . ($hashOk ? 'ok' : 'bad') . ', body ' . ($bodyOk ? 'ok' : 'big'));
+    echo sprintf(
+        "replay %s: families=%d urgent=%d sev[critical=%d high=%d medium=%d] noise=%d role_rows=%d duration_mismatches=%d byte_cap_gaps=%d violations=%d\n",
+        $label, $families, count($doc['urgent']), $mix['critical'], $mix['high'], $mix['medium'], $mix['noise'], count($rows), $mismatch, count($byteGaps), $viol
+    );
+}
+
+if ($replaySkipped > 0) {
+    echo "SKIP: $replaySkipped replay checks (reports/ or fleet-reporter absent)\n";
+}
+
 $cli = escapeshellarg(PHP_BINARY) . ' ' . escapeshellarg(TOOL . '/fleet-log-scan.php');
 $t(str_contains($help, '--iris-republish'), 'help mentions --iris-republish');
 exec($cli . ' --iris-republish /tmp/x.iris.json --region sg 2>&1', $out7, $rc7);
@@ -453,4 +586,4 @@ $t($rc9 === 2, 'republish outside reports exits 2');
 if ($fail) {
     exit(1);
 }
-echo "iris-publish tests: $pass passed\n";
+echo "iris-publish tests: $pass passed, 0 failed, $replaySkipped skipped\n";

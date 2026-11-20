@@ -134,7 +134,21 @@ final class GroupHistory
     public static function record(array $h, int $now, array $roleHours, array $observed, int $keepDays): array
     {
         $date = Tz::manilaDate($now);
-        $h['runs'][] = ['epoch' => $now, 'date' => $date, 'roles' => $roleHours];
+        // A role with no current-version run drops its old (raw-key) groups before the family groups go in.
+        $reset = [];
+        foreach (array_keys($roleHours) as $role) {
+            if (Diff::roleOnBaseline($h, (string)$role)) {
+                $reset[(string)$role] = true;
+            }
+        }
+        if ($reset) {
+            foreach ($h['groups'] as $id => $g) {
+                if (isset($reset[(string)($g['role'] ?? explode('|', (string)$id, 2)[0])])) {
+                    unset($h['groups'][$id]);
+                }
+            }
+        }
+        $h['runs'][] = ['epoch' => $now, 'date' => $date, 'roles' => $roleHours, 'normalizer_version' => Family::VERSION];
         foreach ($observed as $o) {
             $id = $o['role'] . '|' . $o['key'];
             $g = $h['groups'][$id] ?? [

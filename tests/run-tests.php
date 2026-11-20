@@ -7,7 +7,7 @@ declare(strict_types=1);
 
 require __DIR__ . '/lib.php';
 
-use Fls\{Redact, Payload, Pool, Tsv, SiteSource, ServerList, Config, Webhook, Summary, Diff, Fs, Tz};
+use Fls\{Redact, Payload, Pool, Tsv, SiteSource, ServerList, Config, Webhook, Summary, Diff, Fs, Tz, Family, GroupHistory, KnownHarmless, IrisPublish};
 
 $opts = getopt('', ['work:', 'skip-docker']);
 $WORK = $opts['work'] ?? (getenv('HOME') . '/.openclaw/workspace-abella/tmp/fleet-log-scan-build/test-work');
@@ -497,8 +497,10 @@ $stdoutAll .= $out . $err;
 [$rc, $out, $err] = cli(['--daily', '--fixtures', $FX, '--config', $cfgFile, '--now', (string)$nowOf(5)], [], $TRAP);
 $stdoutAll .= $out . $err;
 T::eq($rc, 0, 'day 5 exit 0');
-T::ok((bool)preg_match('/11130 db\s+NEW error \(fatal\/error\/5xx\)\s+yii\\\\db\\\\Exception "Fork child failed in BaseProcessController\.php:305"\s+171/', $out), 'must-flag: 11130 db NEW fatal "Fork child failed" 171');
-T::ok((bool)preg_match('/30030 admin\s+3\.4x\s+warning application "Casino branch money is unavailable in ConstCasinoSlot\.php:836"\s+88 \(usual 26\)/', $out), 'must-flag: 30030 admin Casino branch money 3.4x, 88 (usual 26)');
+T::ok((bool)preg_match('/11130 db\s+NEW error\s+yii\\\\db\\\\Exception "Fork child failed in \{file\}"\s+171/', $out), 'must-flag: 11130 db NEW "Fork child failed" 171, family text');
+$forkLine = array_values(array_filter(explode("\n", $out), fn($l) => str_contains($l, '11130 db') && str_contains($l, 'NEW')))[0] ?? '';
+T::ok($forkLine !== '' && !str_contains($forkLine, 'fatal') && !str_contains($forkLine, '5xx'), 'fork child digest line does not say fatal/5xx');
+T::ok((bool)preg_match('/30030 admin\s+3\.4x\s+warning application "Casino branch money is unavailable in \{file\}"\s+88 \(usual 26\)/', $out), 'must-flag: 30030 admin Casino branch money 3.4x, 88 (usual 26), family text');
 T::contains($out, '10010 service1 possibly out of rotation', 'stale: 10010 service1 possibly out of rotation');
 T::notContains($out, 'telescope', 'known-harmless: new scanner 404 route stays quiet');
 T::notContains($out, 'Sports socket', 'known-harmless: sports socket partial-frame stays quiet (1.2x)');
@@ -509,8 +511,8 @@ T::eq(count($caps), 1, 'day 5: webhook posted exactly once');
 $b = json_decode($caps[0]['body'] ?? '{}', true);
 $flagsSeen = array_map(fn($i) => $i['site'] . ' ' . $i['role'] . ' ' . $i['flag'], $b['items'] ?? []);
 sort($flagsSeen);
-T::eq($flagsSeen, ['11130 db new-fatal', '30030 admin spike'], 'webhook items = the two must-flags');
-T::eq($b['severity'] ?? null, 'critical', 'webhook severity critical on a new fatal');
+T::eq($flagsSeen, ['11130 db new', '30030 admin spike'], 'webhook items = the two must-flags (fork child is new, not new-fatal)');
+T::eq($b['severity'] ?? null, 'warning', 'webhook severity warning: only new items, nothing failed');
 T::eq(array_keys($b), ['schema', 'run_id', 'mode', 'generated_at', 'severity', 'changed', 'baseline_sites', 'servers', 'items', 'failures', 'notes', 'summary', 'summary_status', 'dropped_by_tripwire', 'payload_versions'], 'webhook payload keys');
 assertNoLeaks($caps[0]['body'] ?? '', 'webhook body');
 clearCaptures($FL);
@@ -885,7 +887,126 @@ clearstatcache(true, TOOL . '/webhook.env');
 T::ok(!file_exists(TOOL . '/webhook.env') || (fileperms(TOOL . '/webhook.env') & 0777) === 0600, 'no real webhook.env in the tool dir');
 T::eq(file_exists("$TRAP/TRIPPED") ? file("$TRAP/TRIPPED", FILE_IGNORE_NEW_LINES) : [], [], 'trap: no real ssh/global/cursor-agent/openclaw/launchctl/curl was invoked');
 
-// ---------------------------------------------------------------- 11. GNU/Linux payload parity (local Docker, mawk + GNU coreutils)
+// ---------------------------------------------------------------- Family normalizer, history and severity (added after the Linux parity block was first written)
+// ---------------------------------------------------------------- family normalizer, severity, per-role history version
+T::section('family normalizer');
+$route = static fn(string $f): string => 'yii\\web\\NotFoundHttpException: Unable to resolve the request "some/path". in ' . $f;
+$samples = [
+    $route('Controller.php:149'), $route('Module.php:561'), $route('Module.php:5…'), $route('Module.php:…'), $route('Module.php:56...'),
+    "Callback failed command_id=1a2b3c4d5e6f\n#0 frame", 'Callback failed command_id=1a{n}b3c{n}d5e{n}f ok', 'Callback failed command_id={id}',
+    'Undefined index: foo in Bar.php:12', 'Undefined array key "x"', 'Undefined offset: 3', "it's \"q\" 'r' and abcdef123456 in Foo.php:149...",
+    'Fork child failed in {file}', 'x {n}a{n}b9 y', '', 'in Foo.php:1…', "Unable to resolve the request \"a\" in A.php:1 in B.php:2",
+];
+$notIdem = count(array_filter($samples, fn($x) => Family::normalize(Family::normalize($x)) !== Family::normalize($x)));
+T::eq($notIdem, 0, 'normalize is idempotent on all samples (non-idempotent count)');
+T::ok(Family::normalize($route('Controller.php:149')) !== Family::normalize($route('Module.php:561')), 'Controller.php:149 stays a different family from Module.php:561');
+$trunc = [Family::normalize($route('Module.php:5…')), Family::normalize($route('Module.php:…')), Family::normalize($route('Module.php:56...'))];
+T::ok(count(array_unique($trunc)) === 1 && !str_contains($trunc[0], ' in Module.php') && !str_contains($trunc[0], 'Module.php:5'), 'a truncated Module.php:5… is not its own family (distinct truncated keys: ' . count(array_unique($trunc)) . ')');
+T::eq(Family::normalize('Callback failed command_id=1a{n}b3c{n}d5e{n}f ok'), Family::normalize('Callback failed command_id=1a2b3c4d5e6f ok'), 'command_id split by {n} equals a plain hex command_id');
+T::eq(Family::normalize("Callback failed command_id=1a2b3c4d5e6f\n#0 frame in A.php:5"), Family::normalize('Callback failed command_id=1a2b3c4d5e6f'), 'a second-line stack frame does not change the key');
+T::ok(str_ends_with(Family::normalize($route('Controller.php:149')), 'Unable to resolve the request {path} in Controller.php:149'), 'route family ends with {path} and the complete File.php:line');
+// Inline seed: the real one lives in the gitignored state/known-harmless.json (scanner-404-routes seed with the
+// wp-|wordpress/ alternation); this test builds its own so a fresh checkout does not depend on that file.
+$khSeeds = [['id' => 'scanner-404-routes', 'sites' => '*', 'roles' => '*',
+    'template_re' => '(InvalidRouteException|Unable to resolve the request|Page not found).*(litellm|graphql|telescope|wp-|wordpress/|\\.git)', 'category_re' => '.*']];
+$kh = new KnownHarmless($khSeeds);
+$wpRaw = 'yii\\web\\NotFoundHttpException: Unable to resolve the request "wordpress/". in Controller.php:149';
+T::ok($kh->match('10010', 'service', 'error', 'yii\\web\\HttpException:404', $wpRaw) !== null, 'wordpress/ matches known-harmless on the raw template');
+T::ok($kh->match('10010', 'service', 'error', 'yii\\web\\HttpException:404', Family::normalize($wpRaw)) === null, 'the normalized family no longer carries the path (raw_template is what harmless needs)');
+
+$sent = Family::normalize("Couldn't connect to db and user's session isn't valid");
+T::ok(str_contains($sent, "Couldn't connect") && str_contains($sent, "user's session isn't valid") && !str_contains($sent, '{q}'), 'apostrophes in prose are not paired into {q}');
+T::eq(Family::normalize("Failed with name='abc def' (user='x'), retry"), 'Failed with name={q} (user={q}), retry', 'real single-quoted values are still replaced');
+T::eq(Family::normalize(Family::normalize("Couldn't connect, user's session isn't valid 'x'")), Family::normalize("Couldn't connect, user's session isn't valid 'x'"), 'quote handling is idempotent');
+T::ok(Family::normalize('Cannot decade the facade') === 'Cannot decade the facade' && Family::normalize('id abc123def ok') === 'id {id} ok', 'a hex-letter word survives, a hex run with a digit is {id}');
+$pathRoute = 'yii\\web\\NotFoundHttpException: Unable to resolve the request "a/x.php:5/y" in Module.php:5…';
+$pr = Family::normalize($pathRoute);
+T::ok(!str_contains($pr, 'x.php') && !str_contains($pr, 'Module.php:5') && str_ends_with($pr, 'Unable to resolve the request {path}'), 'a .php:5 inside the request path is never the route suffix');
+T::ok(str_ends_with(Family::normalize('Unable to resolve the request "a/x.php:5/y" in Module.php:561'), '{path} in Module.php:561'), 'a complete final File.php:NNN is still the route suffix');
+
+T::section('history: per-role normalizer version');
+$cfgD = ['diff' => ['spike_factor' => 3.0, 'spike_min_count' => 20, 'history_days' => 8, 'median_days' => 7, 'warm_days' => 3]];
+$kh0 = new KnownHarmless([]);
+$nowH = (int)strtotime('2026-11-20 10:00:00 +0800');
+$obsOf = static function (string $role, string $tpl, int $count = 5, string $level = 'error', string $cat = 'application') use ($nowH): array {
+    return ['role' => $role, 'class' => $role, 'key' => Diff::key($level, $cat, $tpl), 'level' => $level, 'category' => $cat, 'template' => $tpl, 'count' => $count, 'hours' => 24.0, 'first_epoch' => $nowH - 100, 'last_epoch' => $nowH - 10];
+};
+$famKnown = 'Known thing failed in {file}';
+$legacy = ['runs' => [], 'groups' => []];
+foreach ([5, 4, 3, 2, 1] as $back) {
+    $e = $nowH - $back * 86400;
+    $legacy['runs'][] = ['epoch' => $e, 'date' => Tz::manilaDate($e), 'roles' => ['db' => 24.0, 'admin' => 24.0]];
+}
+foreach (['db', 'admin'] as $role) {
+    $k = Diff::key('error', 'application', $famKnown);
+    $days = [];
+    foreach ([5, 4, 3, 2, 1] as $back) {
+        $days[Tz::manilaDate($nowH - $back * 86400)] = ['count' => 24, 'hours' => 24.0];
+    }
+    $legacy['groups'][$role . '|' . $k] = ['role' => $role, 'key' => $k, 'level' => 'error', 'category' => 'application', 'template' => 'old raw key', 'first_seen' => $nowH - 5 * 86400, 'last_seen' => $nowH - 86400, 'days' => $days];
+    $legacy['groups'][$role . '|oldrawkey'] = ['role' => $role, 'key' => 'oldrawkey', 'level' => 'error', 'category' => 'application', 'template' => 'old raw', 'first_seen' => $nowH - 5 * 86400, 'last_seen' => $nowH - 86400, 'days' => $days];
+}
+$ev0 = Diff::evaluate('10010', $legacy, [$obsOf('db', 'Brand new family'), $obsOf('db', $famKnown, 5000)], $nowH, $cfgD, $kh0);
+T::ok(count($ev0['flags']) === 0 && $ev0['baseline'] === true, 'history without the current version yields 0 flags (flags ' . count($ev0['flags']) . ')');
+$rec = GroupHistory::record($legacy, $nowH, ['db' => 24.0], [$obsOf('db', $famKnown, 24)], 8);
+$last = end($rec['runs']);
+T::ok(($last['normalizer_version'] ?? null) === Family::VERSION && $last['roles'] === ['db' => 24.0], 'record stamps normalizer_version beside roles; roles stays role => hours');
+T::eq(GroupHistory::lastRunEpoch($rec, 'db'), $nowH, 'lastRunEpoch still works');
+$dbGroups = array_filter($rec['groups'], fn($g) => $g['role'] === 'db');
+$adminGroups = array_filter($rec['groups'], fn($g) => $g['role'] === 'admin');
+T::ok(count($dbGroups) === 1 && count($adminGroups) === 2, 'record resets db groups only (db ' . count($dbGroups) . ', admin ' . count($adminGroups) . ')');
+$g0 = array_values($dbGroups)[0];
+T::eq(GroupHistory::dailyRates($g0, $nowH + 3600, 7), [], 'after the reset dailyRates for the role are empty');
+$same = Diff::evaluate('10010', $rec, [$obsOf('db', $famKnown, 5000)], $nowH + 3600, $cfgD, $kh0);
+T::ok(count($same['flags']) === 0 && $same['baseline'] === false, 'after record the same family is not new and a same-day spike cannot fire (flags ' . count($same['flags']) . ')');
+$next = Diff::evaluate('10010', $rec, [$obsOf('db', $famKnown), $obsOf('db', 'Genuinely new family')], $nowH + 86400, $cfgD, $kh0);
+T::ok(count($next['flags']) === 1 && $next['flags'][0]['flag'] === 'new', 'a genuinely new family on the next run is flagged once (flags ' . count($next['flags']) . ')');
+$mixed = Diff::evaluate('10010', $rec, [$obsOf('db', 'Genuinely new family'), $obsOf('admin', 'Genuinely new family')], $nowH + 86400, $cfgD, $kh0);
+T::ok(count($mixed['flags']) === 1 && $mixed['flags'][0]['role'] === 'db' && $mixed['baseline'] === false, 'a role absent from the versioned run stays baseline while other roles still diff (flags ' . count($mixed['flags']) . ')');
+$onlyAdmin = Diff::evaluate('10010', $rec, [$obsOf('admin', 'Genuinely new family')], $nowH + 86400, $cfgD, $kh0);
+T::ok(count($onlyAdmin['flags']) === 0 && $onlyAdmin['baseline'] === true, 'every observed role on the baseline reports baseline true');
+$rec2 = GroupHistory::record($rec, $nowH + 86400, ['admin' => 24.0], [$obsOf('admin', $famKnown, 24)], 8);
+$after = Diff::evaluate('10010', $rec2, [$obsOf('admin', 'Genuinely new family')], $nowH + 2 * 86400, $cfgD, $kh0);
+T::ok(count($after['flags']) === 1 && count(array_filter($rec2['groups'], fn($g) => $g['role'] === 'db')) >= 1, 'once the role itself is recorded it diffs (flags ' . count($after['flags']) . ')');
+T::ok(!str_contains(json_encode($rec2), 'raw_template'), 'history never stores raw_template');
+
+T::section('severity: isFatal and Iris families');
+T::ok(!Diff::isFatal('error', 'yii\\db\\Exception', 'Fork child failed in {file}') && !Diff::isFatal('error', 'yii\\base\\ErrorException:8', 'Undefined array key {key}') && !Diff::isFatal('error', 'application', 'plain error'), 'plain error, undefined key and fork child are not fatal');
+T::ok(Diff::isFatal('fatal', 'c', 'x') && Diff::isFatal('error', 'c', 'PHP Fatal error: Allowed memory size') && Diff::isFatal('error', 'c', 'Uncaught exception') && Diff::isFatal('error', 'yii\\web\\HttpException:503', 'x') && Diff::isFatal('error', 'c', 'x http_status=500'), 'fatal level, PHP fatal, uncaught and 5xx are fatal');
+T::ok(Diff::isFatal('error', 'ParseError', 'ParseError: syntax error, unexpected token') && Diff::isFatal('error', 'yii\\base\\ErrorException', 'Allowed memory size of {n} bytes exhausted') && Diff::isFatal('error', 'yii\\base\\ErrorException:64', 'x') && !Diff::isFatal('error', 'yii\\base\\ErrorException:8', 'Undefined index: a'), 'ParseError, memory exhaustion and E_COMPILE_ERROR are fatal; E_NOTICE is not');
+$flagOf = static fn(string $tpl, string $level = 'error', string $cat = 'application', string $kind = 'new', string $site = '11050', string $role = 'admin', int $count = 3): array => ['site' => $site, 'role' => $role, 'flag' => $kind, 'level' => $level, 'category' => $cat, 'template' => $tpl, 'count' => $count];
+$docOf = static fn(array $flags, array $failures = []): array => IrisPublish::fromRun(['run_id' => '20261120T010101Z-abcd1234', 'mode' => 'daily', 'started' => $nowH, 'servers' => 2, 'flags' => $flags, 'failures' => $failures, 'notes' => [], 'quiet' => []], [], $nowH + 60);
+$sevOf = static function (array $d, string $needle): ?string {
+    foreach ($d['top_signatures'] as $s) {
+        if (str_contains($s['signature'], $needle)) {
+            return $s['severity'];
+        }
+    }
+    return null;
+};
+$urgentN = static fn(array $d, string $needle): int => count(array_filter($d['urgent'], fn($u) => str_contains($u['title'], $needle)));
+$d = $docOf([$flagOf('Undefined index: foo in Bar.php:12')]);
+T::ok($sevOf($d, 'Undefined array key') === 'high' && $urgentN($d, 'Undefined array key') === 1, 'undefined index is high and urgent, not critical');
+$d = $docOf([$flagOf('PHP Fatal error: Allowed memory size exhausted', 'error', 'application', 'new-fatal'), $flagOf('Gateway blew up', 'error', 'yii\\web\\HttpException:502')]);
+T::ok($sevOf($d, 'Fatal error') === 'critical' && $sevOf($d, 'Gateway') === 'critical' && $urgentN($d, 'Fatal error') === 1 && $urgentN($d, 'Gateway') === 1, 'PHP fatal and HTTP 5xx are critical and urgent');
+$d = $docOf([$flagOf($route('Controller.php:149'), 'error', 'yii\\web\\HttpException:404', 'spike'), $flagOf($route('Module.php:561'), 'error', 'yii\\web\\HttpException:404', 'new', '11080', 'db', 4), $flagOf('Callback failed command_id=1a2b3c4d5e6f')]);
+$noise = count(array_filter($d['top_signatures'], fn($s) => $s['severity'] === 'noise'));
+T::ok($noise === 3 && count($d['urgent']) === 0 && array_sum(array_column($d['top_signatures'], 'count')) === 10, 'route families and a new command_id are noise, counted, not urgent (noise ' . $noise . ', urgent ' . count($d['urgent']) . ')');
+$d = $docOf([$flagOf('ParseError: syntax error, unexpected token in A.php:3', 'error', 'ParseError', 'new'), $flagOf('Allowed memory size of {n} bytes exhausted', 'error', 'yii\\base\\ErrorException', 'new')]);
+T::ok($sevOf($d, 'ParseError') === 'critical' && $sevOf($d, 'Allowed memory') === 'critical' && count($d['urgent']) === 2, 'ParseError and memory exhaustion are critical and urgent');
+$d = $docOf([$flagOf('PHP Fatal error: Callback failed command_id=1a2b3c4d5e6f', 'error', 'application', 'new-fatal'), $flagOf('Gateway failed command_id=1a2b3c4d5e6f', 'error', 'yii\\web\\HttpException:502'), $flagOf($route('Controller.php:149'), 'error', 'yii\\web\\HttpException:404', 'new'), $flagOf('Plain callback failed command_id=1a2b3c4d5e6f')]);
+T::ok($sevOf($d, 'PHP Fatal error') === 'critical' && $sevOf($d, 'Gateway failed') === 'critical' && $urgentN($d, 'PHP Fatal error') === 1 && $urgentN($d, 'Gateway failed') === 1 && $sevOf($d, 'Unable to resolve') === 'noise' && $sevOf($d, 'Plain callback') === 'noise', 'fatal and 502 with command_id stay critical+urgent; route and non-spike command_id stay noise');
+$d = $docOf([$flagOf('Callback failed command_id=1a{n}b3c{n}d5e{n}f', 'error', 'application', 'spike'), $flagOf('Other callback failed command_id=1a2b3c4d5e6f', 'warning', 'application', 'spike')]);
+T::ok($sevOf($d, 'Callback failed') === 'high' && $sevOf($d, 'Other callback') === 'medium' && count($d['urgent']) === 2, 'command_id with a spike is urgent: high for error, medium for warning');
+$d = $docOf([$flagOf('Same family in A.php:5', 'error', 'application', 'new', '11050', 'admin', 2), $flagOf('Same family in B.php:9', 'error', 'application', 'new', '11080', 'db', 3)]);
+T::ok(count($d['top_signatures']) === 1 && $d['top_signatures'][0]['count'] === 5 && count($d['urgent']) === 1, 'flags with one normalized signature are one top_signatures row with summed counts');
+$d = $docOf([], [['site' => '10030', 'role' => '-', 'status' => 'list unreadable'], ['site' => '11050', 'role' => 'db', 'status' => 'timeout']]);
+T::ok($urgentN($d, '10030') === 1 && $urgentN($d, '11050') === 1 && count(array_filter($d['urgent'], fn($u) => $u['severity'] === 'critical')) === 2, 'each scan failure (timeouts too) is a critical urgent row with the site id');
+T::ok(count(array_filter($d['coverage_gaps'], fn($g) => ($g['type'] ?? '') === 'visibility' && str_contains($g['note'], '10030'))) === 1 && count(array_filter($d['sites'], fn($s) => $s['site_id'] === '10030' && $s['roles'] === [])) === 1, 'visibility note carries the site id and role "-" makes no role row');
+$d = $docOf([]);
+T::ok($d['suggested_fixes'] === [] && $d['urgent'] === [], 'an empty run has an empty fix list');
+
+// ---------------------------------------------------------------- GNU/Linux payload parity (local Docker, mawk + GNU coreutils)
 T::section('payload parity in local Linux Docker (no network)');
 if (isset($opts['skip-docker'])) {
     echo "  skip docker (--skip-docker)\n";

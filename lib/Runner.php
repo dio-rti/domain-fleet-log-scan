@@ -203,6 +203,7 @@ final class Runner
         $groupTable = [];
         $kh = KnownHarmless::load($cfg);
         $bySite = [];
+        $advanced = [];
         foreach ($results as $id => $r) {
             $bySite[$meta[$id]['site']][$id] = $r;
         }
@@ -256,11 +257,15 @@ final class Runner
                 }
                 $agg = [];
                 foreach ($t->groups as $g) {
-                    $k = Diff::key($g['level'], $g['category'], $g['template']);
+                    $raw = $g['template'];
+                    $fam = Family::normalize($raw);
+                    $k = Diff::key($g['level'], $g['category'], $fam);
                     $fe = Tz::serverTsToEpoch($g['first'], $t->header['offset']);
                     $le = Tz::serverTsToEpoch($g['last'], $t->header['offset']);
                     if (!isset($agg[$k])) {
-                        $agg[$k] = ['role' => $role, 'class' => $m['class'], 'key' => $k, 'level' => $g['level'], 'category' => $g['category'], 'template' => $g['template'], 'count' => 0, 'hours' => $hours, 'first_epoch' => $fe, 'last_epoch' => $le];
+                        $agg[$k] = ['role' => $role, 'class' => $m['class'], 'key' => $k, 'level' => $g['level'], 'category' => $g['category'], 'template' => $fam, 'raw_template' => $raw, 'count' => 0, 'hours' => $hours, 'first_epoch' => $fe, 'last_epoch' => $le];
+                    } elseif ($kh->match($site, $m['class'], $g['level'], $g['category'], $agg[$k]['raw_template']) !== null && $kh->match($site, $m['class'], $g['level'], $g['category'], $raw) === null) {
+                        $agg[$k]['raw_template'] = $raw; // a family is harmless only if every member is
                     }
                     $agg[$k]['count'] += $g['count'];
                     $agg[$k]['first_epoch'] = min($agg[$k]['first_epoch'] ?? PHP_INT_MAX, $fe ?? PHP_INT_MAX);
@@ -271,6 +276,7 @@ final class Runner
                 }
                 if (empty($this->opt['dry_run'])) {
                     $cps[$site] = Checkpoints::advance($cps[$site], $role, $t, $this->now);
+                    $advanced[$id] = true;
                 }
             }
             // stale / quiet checks on app.log
@@ -296,7 +302,7 @@ final class Runner
                     $observations[] = sprintf('%s %s app.log stopped at %s after steady activity', $site, $role, Tz::manila($lastE, 'H:i'));
                 }
             }
-            $ev = Diff::evaluate($site, $hist[$site], $observed, $this->now, $cfg, $kh);
+            $ev = Diff::evaluate($site, $hist[$site], $observed, $this->now, $cfg, $kh, array_keys($roleHours));
             if ($ev['baseline'] && $roleHours) {
                 $baselineSites[] = $site;
                 $baselineGroups += count($observed);
@@ -316,13 +322,17 @@ final class Runner
             }
         }
 
+        $scans = [];
+        foreach ($results as $id => $r) {
+            $scans[] = ['site' => $meta[$id]['site'], 'role' => $meta[$id]['role'], 'status' => (string)$r['status'], 'duration' => round((float)$r['duration'], 1), 'checkpoint_saved' => isset($advanced[$id])];
+        }
         if ($listPartial) {
             $failures[] = ['site' => '-', 'role' => '-', 'status' => 'site list partial'];
         }
         $sourceProblem = $listPartial || (bool)array_filter($notes, fn($n) => str_starts_with($n, 'site list: global CLI') && str_contains($n, 'include list'));
         $run = [
             'run_id' => $this->runId, 'mode' => $this->opt['mode'], 'started' => $this->now, 'servers' => $serverCount,
-            'flags' => $flags, 'failures' => $failures, 'quiet' => $quiet, 'observations' => $observations, 'notes' => array_values(array_unique($notes)),
+            'flags' => $flags, 'failures' => $failures, 'scans' => $scans, 'quiet' => $quiet, 'observations' => $observations, 'notes' => array_values(array_unique($notes)),
             'connect_timeout' => (int)$cfg['timeouts']['connect'], 'total_timeout' => (int)$cfg['timeouts']['total'],
             'window_hours' => (int)$cfg['first_run_hours'], 'executor' => 'fleet-log-scan',
             'baseline_sites' => $baselineSites, 'baseline_groups' => $baselineGroups,

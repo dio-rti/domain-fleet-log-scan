@@ -109,6 +109,28 @@ final class IrisPublish
         if (!empty($opt['site']) && is_string($opt['site'])) {
             $sitesSeen[$opt['site']] = true;
         }
+        // One role row per scan, with its own duration and checkpoint result.
+        foreach ($run['scans'] ?? [] as $sc) {
+            if (!is_array($sc)) {
+                continue;
+            }
+            $site = (string)($sc['site'] ?? '');
+            $role = (string)($sc['role'] ?? '');
+            $note($site, $role);
+            if (!isset($roleRows[$site][$role])) {
+                continue;
+            }
+            $st = (string)($sc['status'] ?? 'ok');
+            $roleRows[$site][$role] = [
+                'role' => $role,
+                'status' => in_array($st, ['ok', 'timeout', 'unreachable', 'reset', 'skipped-breaker'], true) ? $st : 'unreachable',
+                'duration_seconds' => round(max(0.0, (float)($sc['duration'] ?? 0)), 1),
+                'checkpoint_saved' => !empty($sc['checkpoint_saved']),
+            ];
+            if ($st === 'timeout') {
+                $roleRows[$site][$role]['error'] = ['type' => 'timeout', 'limit_seconds' => $totalTimeout];
+            }
+        }
         $totals = ['errors' => 0, 'warnings' => 0, 'fatals' => 0, 'http_500_bursts' => 0];
         $groups = [];
         foreach ($flags as $f) {
@@ -116,53 +138,65 @@ final class IrisPublish
             $l = $lvl($f['level'] ?? '');
             $count = (int)$f['count'];
             $totals[$l === 'fatal' ? 'fatals' : ($l === 'warning' ? 'warnings' : 'errors')] += $count;
-            $fatal = ($f['flag'] ?? '') === 'new-fatal';
-            $key = ($fatal ? 'fatal' : $l) . "\n" . (string)$f['template'];
+            $sig = Family::normalize((string)$f['template']);
+            $key = $l . "\n" . $sig;
             if (!isset($groups[$key])) {
-                $groups[$key] = ['template' => (string)$f['template'], 'level' => $l, 'fatal' => $fatal, 'locs' => []];
+                $groups[$key] = ['template' => $sig, 'level' => $l, 'fatal' => false, 'spike' => false, 'raw' => (string)($f['raw_template'] ?? $f['template']), 'locs' => []];
             }
-            $groups[$key]['fatal'] = $groups[$key]['fatal'] || $fatal;
+            $groups[$key]['fatal'] = $groups[$key]['fatal'] || Diff::isFatal($l, (string)($f['category'] ?? ''), (string)($f['raw_template'] ?? $f['template']));
+            $groups[$key]['spike'] = $groups[$key]['spike'] || ($f['flag'] ?? '') === 'spike';
             $groups[$key]['locs'][] = ['site' => (string)$f['site'], 'role' => (string)$f['role'], 'count' => $count];
         }
         $sigs = [];
         $urgent = [];
-        $n = 0;
         foreach ($groups as $g) {
-            $locs = [];
             $breakdown = [];
             $sum = 0;
             foreach ($g['locs'] as $loc) {
                 if ($loc['site'] === '-' || $loc['site'] === '' || $loc['role'] === '-' || $loc['role'] === '') {
                     continue;
                 }
-                $locs[] = $loc['site'] . '/' . $loc['role'];
                 $breakdown[$loc['site']][$loc['role']] = ($breakdown[$loc['site']][$loc['role']] ?? 0) + $loc['count'];
                 $sum += $loc['count'];
             }
+            $locs = [];
+            $roles = [];
+            foreach ($breakdown as $site => $byRole) {
+                foreach ($byRole as $role => $_) {
+                    $locs[] = $site . '/' . $role;
+                    $roles[$role] = true;
+                }
+            }
+            $sev = $g['fatal'] ? 'critical' : ($g['level'] === 'warning' ? 'medium' : 'high');
+            // A fatal/5xx family is never noise, even when its template carries a command_id.
+            $noise = !$g['fatal'] && (str_contains($g['template'], 'Unable to resolve the request {path}')
+                || (str_contains($g['template'], 'command_id={id}') && !$g['spike']));
             $sigs[] = [
                 'count' => $sum, 'level' => $g['level'],
-                'severity' => $g['fatal'] ? 'critical' : ($g['level'] === 'warning' ? 'medium' : 'high'),
+                'severity' => $noise ? 'noise' : $sev,
                 'locations' => $locs ?: ['unknown/admin'],
                 'signature' => $g['template'],
             ];
-            $sev = $g['fatal'] ? 'critical' : ($g['level'] === 'warning' ? 'medium' : 'high');
+            if ($noise) {
+                continue;
+            }
             $row = [
-                'id' => 'sig-' . substr(hash('sha256', $g['level'] . "\n" . $g['template']), 0, 12),
+                'id' => 'sig-' . substr(strtr(hash('sha256', $g['level'] . "\n" . $g['template']), '0123456789', 'ghijklmnop'), 0, 12), // digit-free: a digit run trips the redactor
                 'severity' => $sev,
                 'title' => '"' . $g['template'] . '" errors came up ' . $sum . ' times',
                 'count' => $sum,
             ];
             if ($breakdown) {
                 $row['breakdown'] = $breakdown;
+                $row['sites'] = array_map('strval', array_keys($breakdown));
+                $row['roles'] = array_map('strval', array_keys($roles));
             }
-            $detail = IrisPatterns::match(null, null, $g['template']);
+            $detail = IrisPatterns::match(null, null, $g['template']) ?? IrisPatterns::match(null, null, $g['raw']);
             if ($detail !== null) {
                 $row['detail'] = $detail;
             }
             $urgent[] = $row;
-            $n++;
         }
-        unset($n);
         usort($sigs, fn($a, $b) => $b['count'] <=> $a['count']);
         $sigRank = [];
         foreach ($sigs as $i => &$s) {
@@ -178,29 +212,37 @@ final class IrisPublish
             $role = (string)$f['role'];
             $st = (string)$f['status'];
             $note($site, $role);
-            if (str_contains($st, 'timeout') && $site !== '-' && $role !== '-' && $role !== '') {
+            $hasRole = $site !== '-' && $site !== '' && $role !== '-' && $role !== '';
+            $where = ($site === '-' || $site === '') ? '' : ($hasRole ? $site . '/' . $role : $site);
+            if (str_contains($st, 'timeout') && $hasRole) {
                 if (isset($roleRows[$site][$role])) {
                     $roleRows[$site][$role]['status'] = 'timeout';
                     $roleRows[$site][$role]['error'] = ['type' => 'timeout', 'limit_seconds' => $totalTimeout];
                 }
                 $timedOut[] = $site . '/' . $role;
-                continue;
+            } else {
+                if ($hasRole && isset($roleRows[$site][$role]) && $roleRows[$site][$role]['status'] === 'ok') {
+                    $roleRows[$site][$role]['status'] = str_contains($st, 'reset') ? 'reset' : 'unreachable';
+                }
+                $gaps[] = ['type' => 'visibility', 'note' => 'Scan failure' . ($where !== '' ? ' on ' . $where : '') . ': ' . $st] + ($role !== '-' && $role !== '' ? ['roles' => [$role]] : []);
             }
-            $kind = 'visibility';
-            if ($site !== '-' && $role !== '-' && isset($roleRows[$site][$role])) {
-                $roleRows[$site][$role]['status'] = str_contains($st, 'reset') ? 'reset' : 'unreachable';
+            $fail = ['id' => 'failure-' . $i, 'severity' => 'critical', 'title' => 'Scan failure' . ($where !== '' ? ' on ' . $where : '') . ': ' . $st];
+            if ($site !== '-' && $site !== '') {
+                $fail['sites'] = [$site];
+                if ($hasRole) {
+                    $fail['roles'] = [$role];
+                }
             }
-            $gaps[] = ['type' => $kind, 'note' => 'scan failure: ' . $st] + ($role !== '-' && $role !== '' ? ['roles' => [$role]] : []);
-            $urgent[] = ['id' => 'failure-' . $i, 'severity' => 'high', 'title' => 'Scan failure: ' . $st];
+            $urgent[] = $fail;
         }
         if ($timedOut) {
-            $rolesOnly = array_map(static fn(string $sr): string => explode('/', $sr, 2)[1], $timedOut);
-            $pattern = count(array_unique($rolesOnly)) === 1 ? IrisPatterns::match($rolesOnly[0], 'timeout', null) : null;
-            $gaps[] = [
-                'type' => 'timeout',
-                'roles' => $timedOut,
-                'note' => $pattern ?? ('Read timed out on ' . implode(', ', $timedOut) . '.'),
-            ];
+            $gaps[] = ['type' => 'timeout', 'roles' => $timedOut, 'note' => 'Read timed out on ' . implode(', ', $timedOut) . '.'];
+        }
+        foreach ($run['notes'] ?? [] as $n) {
+            if (is_string($n) && preg_match('/^([A-Za-z0-9_-]{1,32}) ([A-Za-z0-9_-]{1,32}) (\S+) capped: newest (\d+) MB read, [0-9.]+ MB skipped$/', $n, $m) === 1) {
+                $note($m[1], $m[2]);
+                $gaps[] = ['type' => 'byte_cap', 'roles' => [$m[1] . '/' . $m[2]], 'note' => $n, 'cap_mb_per_file' => (int)$m[4]];
+            }
         }
 
         foreach ($run['quiet'] ?? [] as $q) {
@@ -321,8 +363,8 @@ final class IrisPublish
                 'delivery' => 'none', 'ipv4_in_outputs' => 0, 'secrets_in_outputs' => 0, 'server_writes' => false, 'sudo_used' => false,
             ],
             'artifacts' => ['report_md' => null, 'tool_report' => null],
-            'suggested_fixes' => [],
         ];
+        $doc['suggested_fixes'] = self::rulesFixes($doc);
         if (self::summaryUsed($run)) {
             $doc['ai_summary'] = $run['ai_summary'];
         }
