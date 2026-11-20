@@ -1,0 +1,16 @@
+{
+  "cases": [
+    {"name": "thousands separators", "ok": true, "text": "8,108", "doc": {"n": 8108}},
+    {"name": "05 equals 5", "ok": true, "text": "at 05", "doc": {"clock": "05:09"}},
+    {"name": "12-hour hour", "ok": true, "text": "at 9", "doc": {"timing": {"started_at": "2026-11-19T21:00:00Z"}}},
+    {"name": "service1 is not a token", "ok": true, "text": "service1", "doc": {"note": "service1"}},
+    {"name": "5xx is not a token", "ok": true, "text": "5xx", "doc": {"note": "5xx"}},
+    {"name": "bare 1 is not hidden inside service1", "ok": false, "text": "1", "doc": {"note": "service1"}},
+    {"name": "decimal only when quoted", "ok": true, "text": "model 4.7", "doc": {"model": "grok-4.7-high"}},
+    {"name": "4.7 absent from strings", "ok": false, "text": "4.7", "doc": {"n": 4}},
+    {"name": "key-derived 500", "ok": true, "text": "500", "doc": {"totals": {"http_500_bursts": 0}}},
+    {"name": "breakdown site-id key", "ok": true, "text": "11140", "doc": {"breakdown": {"11140": {"admin": 1}}}},
+    {"name": "scope.sites length", "ok": true, "text": "3 sites", "doc": {"scope": {"sites": ["a", "b", "c"]}}},
+    {"name": "invented 15,080", "ok": false, "text": "15,080", "doc": {"n": 1}}
+  ]
+}

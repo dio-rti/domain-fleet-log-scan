@@ -132,8 +132,14 @@ final class Webhook
     /** POST once. Returns a masked status string; never throws. */
     public function post(array $payload): string
     {
+        return $this->postResult($payload)['status'];
+    }
+
+    /** @return array{code:int, body:string, status:string} */
+    public function postResult(array $payload): array
+    {
         if (!$this->enabled()) {
-            return 'webhook disabled: ' . $this->disabledReason;
+            return ['code' => 0, 'body' => '', 'status' => 'webhook disabled: ' . $this->disabledReason];
         }
         $body = json_encode($payload, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
         $headers = "Content-Type: application/json\r\nUser-Agent: fleet-log-scan/1\r\n";
@@ -163,9 +169,10 @@ final class Webhook
         }
         if ($resp === false && $code === 0) {
             $why = $err && stripos($err, 'timed out') !== false ? 'timeout' : 'connection failed';
-            return 'webhook delivery error: ' . $why;
+            return ['code' => 0, 'body' => '', 'status' => 'webhook delivery error: ' . $why];
         }
-        return $code >= 200 && $code < 300 ? 'webhook sent (HTTP ' . $code . ')' : 'webhook delivery error: HTTP ' . $code;
+        $status = $code >= 200 && $code < 300 ? 'webhook sent (HTTP ' . $code . ')' : 'webhook delivery error: HTTP ' . $code;
+        return ['code' => $code, 'body' => $resp === false ? '' : (string)$resp, 'status' => $status];
     }
 }
 

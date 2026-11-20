@@ -1,0 +1,389 @@
+{
+  "schema_version": "1.0",
+  "report_type": "fleet_log_scan",
+  "run_type": "fleet_log_scan",
+  "job": {
+    "job_id": "sg-log-scan-20261120",
+    "run_id": "20261119T210900Z-a1b2c3d4",
+    "requested_by": "scheduler",
+    "executor": "cursor"
+  },
+  "scope": {
+    "region": "sg",
+    "mode": "read_only",
+    "sites": [
+      "11050",
+      "11080",
+      "11090",
+      "11100",
+      "11120",
+      "11130",
+      "11140"
+    ],
+    "window": {
+      "type": "rolling",
+      "hours": 24,
+      "end": "2026-11-19T21:12:00Z"
+    }
+  },
+  "timing": {
+    "started_at": "2026-11-19T21:09:00Z",
+    "finished_at": "2026-11-19T21:12:00Z",
+    "duration_seconds": 180,
+    "timezone_note": "Human clock is Asia/Manila."
+  },
+  "result": {
+    "status": "partial",
+    "exit_code": 5,
+    "roles_total": 23,
+    "roles_ok": 20,
+    "roles_failed": 3
+  },
+  "totals": {
+    "errors": 23183,
+    "warnings": 6346,
+    "fatals": 0,
+    "http_500_bursts": 0
+  },
+  "sites": [
+    {
+      "site_id": "11050",
+      "roles_total": 4,
+      "roles_ok": 3,
+      "errors": 0,
+      "warnings": 0,
+      "roles": [
+        {
+          "role": "admin",
+          "status": "ok",
+          "duration_seconds": 1,
+          "checkpoint_saved": true
+        },
+        {
+          "role": "db",
+          "status": "timeout",
+          "duration_seconds": 120,
+          "checkpoint_saved": false,
+          "error": {
+            "type": "timeout",
+            "limit_seconds": 120
+          }
+        },
+        {
+          "role": "service1",
+          "status": "ok",
+          "duration_seconds": 1,
+          "checkpoint_saved": true
+        },
+        {
+          "role": "service2",
+          "status": "ok",
+          "duration_seconds": 1,
+          "checkpoint_saved": true
+        }
+      ]
+    },
+    {
+      "site_id": "11080",
+      "roles_total": 3,
+      "roles_ok": 3,
+      "errors": 0,
+      "warnings": 0,
+      "roles": [
+        {
+          "role": "admin",
+          "status": "ok",
+          "duration_seconds": 1,
+          "checkpoint_saved": true,
+          "log_last_write_clock": {
+            "time": "05:02",
+            "note": "date and time zone absent in source"
+          }
+        },
+        {
+          "role": "db",
+          "status": "ok",
+          "duration_seconds": 1,
+          "checkpoint_saved": true,
+          "log_last_write_clock": {
+            "time": "04:58",
+            "note": "date and time zone absent in source"
+          }
+        },
+        {
+          "role": "service1",
+          "status": "ok",
+          "duration_seconds": 1,
+          "checkpoint_saved": true
+        }
+      ]
+    },
+    {
+      "site_id": "11090",
+      "roles_total": 3,
+      "roles_ok": 3,
+      "errors": 0,
+      "warnings": 0,
+      "roles": [
+        {
+          "role": "admin",
+          "status": "ok",
+          "duration_seconds": 1,
+          "checkpoint_saved": true,
+          "log_last_write_clock": {
+            "time": "03:30",
+            "note": "date and time zone absent in source"
+          }
+        },
+        {
+          "role": "db",
+          "status": "ok",
+          "duration_seconds": 1,
+          "checkpoint_saved": true
+        },
+        {
+          "role": "service1",
+          "status": "ok",
+          "duration_seconds": 1,
+          "checkpoint_saved": true
+        }
+      ]
+    },
+    {
+      "site_id": "11100",
+      "roles_total": 3,
+      "roles_ok": 2,
+      "errors": 0,
+      "warnings": 0,
+      "roles": [
+        {
+          "role": "admin",
+          "status": "ok",
+          "duration_seconds": 1,
+          "checkpoint_saved": true,
+          "log_last_write_clock": {
+            "time": "21:15",
+            "note": "date and time zone absent in source"
+          }
+        },
+        {
+          "role": "db",
+          "status": "timeout",
+          "duration_seconds": 120,
+          "checkpoint_saved": false,
+          "error": {
+            "type": "timeout",
+            "limit_seconds": 120
+          }
+        },
+        {
+          "role": "service1",
+          "status": "ok",
+          "duration_seconds": 1,
+          "checkpoint_saved": true
+        }
+      ]
+    },
+    {
+      "site_id": "11120",
+      "roles_total": 3,
+      "roles_ok": 3,
+      "errors": 0,
+      "warnings": 0,
+      "roles": [
+        {
+          "role": "admin",
+          "status": "ok",
+          "duration_seconds": 1,
+          "checkpoint_saved": true
+        },
+        {
+          "role": "db",
+          "status": "ok",
+          "duration_seconds": 1,
+          "checkpoint_saved": true,
+          "log_last_write_clock": {
+            "time": "23:47",
+            "note": "date and time zone absent in source"
+          }
+        },
+        {
+          "role": "service1",
+          "status": "ok",
+          "duration_seconds": 1,
+          "checkpoint_saved": true
+        }
+      ]
+    },
+    {
+      "site_id": "11130",
+      "roles_total": 3,
+      "roles_ok": 3,
+      "errors": 0,
+      "warnings": 0,
+      "roles": [
+        {
+          "role": "admin",
+          "status": "ok",
+          "duration_seconds": 1,
+          "checkpoint_saved": true
+        },
+        {
+          "role": "db",
+          "status": "ok",
+          "duration_seconds": 1,
+          "checkpoint_saved": true
+        },
+        {
+          "role": "service1",
+          "status": "ok",
+          "duration_seconds": 1,
+          "checkpoint_saved": true
+        }
+      ]
+    },
+    {
+      "site_id": "11140",
+      "roles_total": 4,
+      "roles_ok": 3,
+      "errors": 0,
+      "warnings": 0,
+      "roles": [
+        {
+          "role": "admin",
+          "status": "ok",
+          "duration_seconds": 1,
+          "checkpoint_saved": true
+        },
+        {
+          "role": "db",
+          "status": "timeout",
+          "duration_seconds": 120,
+          "checkpoint_saved": false,
+          "error": {
+            "type": "timeout",
+            "limit_seconds": 120
+          }
+        },
+        {
+          "role": "service1",
+          "status": "ok",
+          "duration_seconds": 1,
+          "checkpoint_saved": true
+        },
+        {
+          "role": "service2",
+          "status": "ok",
+          "duration_seconds": 1,
+          "checkpoint_saved": true
+        }
+      ]
+    }
+  ],
+  "top_signatures": [
+    {
+      "rank": 1,
+      "count": 89,
+      "level": "error",
+      "severity": "high",
+      "locations": [
+        "11120/service1",
+        "11140/admin",
+        "11050/service1"
+      ],
+      "signature": "Connection refused"
+    }
+  ],
+  "urgent": [
+    {
+      "id": "u-11140-access",
+      "severity": "critical",
+      "title": "11140 database access is failing",
+      "breakdown": {
+        "11140": {
+          "admin": 8108,
+          "service1": 6972
+        }
+      },
+      "detail": "Admin errors are \"access denied\" and service1 errors are \"host not allowed\". The 11140 db log itself was not read because of the timeout."
+    },
+    {
+      "id": "u-11130-stats",
+      "severity": "high",
+      "title": "11130 db had background-job failures tied to _statsLogProcess",
+      "breakdown": {
+        "11130": {
+          "db": 4108
+        }
+      }
+    },
+    {
+      "id": "u-conn-refused",
+      "severity": "high",
+      "title": "\"Connection refused\" database errors came up 89 times",
+      "count": 89,
+      "breakdown": {
+        "11120": {
+          "service1": 48
+        },
+        "11140": {
+          "admin": 27
+        },
+        "11050": {
+          "service1": 14
+        }
+      }
+    },
+    {
+      "id": "u-11090-cmd",
+      "severity": "medium",
+      "title": "11090 had \"Required server command failed\" errors",
+      "breakdown": {
+        "11090": {
+          "service1": 1441
+        }
+      },
+      "detail": "Also lock and cache permission errors. Same pattern as 30010 on VERTEX."
+    }
+  ],
+  "coverage_gaps": [
+    {
+      "type": "timeout",
+      "roles": [
+        "11050/db",
+        "11100/db",
+        "11140/db"
+      ],
+      "note": "Same problem as 30000/db.",
+      "fix": "a longer timeout, or a size cap on the first read."
+    }
+  ],
+  "config": {
+    "connect_timeout_seconds": 15,
+    "total_timeout_seconds": 120,
+    "byte_cap_mb_per_file": 50,
+    "first_run_hours": 24
+  },
+  "safety": {
+    "live_enabled_after_run": false,
+    "state_disabled_present": true,
+    "webhook_env_present": false,
+    "launch_agent_present": false,
+    "summary_model_used": false,
+    "delivery": "webhook",
+    "ipv4_in_outputs": 0,
+    "secrets_in_outputs": 0,
+    "server_writes": false,
+    "sudo_used": false
+  },
+  "artifacts": {
+    "report_md": null,
+    "tool_report": null
+  },
+  "suggested_fixes": [],
+  "ai_summary": {
+    "text": null,
+    "model": null,
+    "status": "skipped"
+  }
+}

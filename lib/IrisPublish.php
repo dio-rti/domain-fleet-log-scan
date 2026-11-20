@@ -79,8 +79,11 @@ final class IrisPublish
         $failures = array_values($run['failures'] ?? []);
         $started = (int)($run['started'] ?? $now);
         $lvl = static fn($l) => in_array($l, ['error', 'warning', 'fatal'], true) ? $l : 'error';
+        $totalTimeout = (int)($run['total_timeout'] ?? $opt['total_timeout'] ?? 120);
+        $connectTimeout = (int)($run['connect_timeout'] ?? $opt['connect_timeout'] ?? 15);
+        $windowHours = (int)($run['window_hours'] ?? $opt['window_hours'] ?? 24);
 
-        $roleRows = [];   // site => role => row
+        $roleRows = [];
         $sitesSeen = [];
         $note = static function (string $site, string $role) use (&$roleRows, &$sitesSeen): void {
             if ($site === '-' || $site === '') {
@@ -95,42 +98,145 @@ final class IrisPublish
             $sitesSeen[$opt['site']] = true;
         }
         $totals = ['errors' => 0, 'warnings' => 0, 'fatals' => 0, 'http_500_bursts' => 0];
-        $sigs = [];
-        $urgent = [];
+        $groups = [];
         foreach ($flags as $f) {
             $note((string)$f['site'], (string)$f['role']);
             $l = $lvl($f['level'] ?? '');
-            $totals[$l === 'fatal' ? 'fatals' : ($l === 'warning' ? 'warnings' : 'errors')] += (int)$f['count'];
+            $count = (int)$f['count'];
+            $totals[$l === 'fatal' ? 'fatals' : ($l === 'warning' ? 'warnings' : 'errors')] += $count;
             $fatal = ($f['flag'] ?? '') === 'new-fatal';
-            $sigs[] = [
-                'count' => (int)$f['count'], 'level' => $l,
-                'severity' => $fatal ? 'critical' : ($l === 'warning' ? 'medium' : 'high'),
-                'locations' => [$f['site'] . '/' . $f['role']],
-                'signature' => (string)$f['template'],
-            ];
-            if ($fatal) {
-                $urgent[] = ['id' => 'new-fatal-' . count($urgent), 'severity' => 'critical', 'title' => 'New fatal group', 'sites' => [(string)$f['site']], 'roles' => [(string)$f['role']], 'count' => (int)$f['count']];
+            $key = ($fatal ? 'fatal' : $l) . "\n" . (string)$f['template'];
+            if (!isset($groups[$key])) {
+                $groups[$key] = ['template' => (string)$f['template'], 'level' => $l, 'fatal' => $fatal, 'locs' => []];
             }
+            $groups[$key]['fatal'] = $groups[$key]['fatal'] || $fatal;
+            $groups[$key]['locs'][] = ['site' => (string)$f['site'], 'role' => (string)$f['role'], 'count' => $count];
         }
+        $sigs = [];
+        $urgent = [];
+        $n = 0;
+        foreach ($groups as $g) {
+            $locs = [];
+            $breakdown = [];
+            $sum = 0;
+            foreach ($g['locs'] as $loc) {
+                if ($loc['site'] === '-' || $loc['site'] === '' || $loc['role'] === '-' || $loc['role'] === '') {
+                    continue;
+                }
+                $locs[] = $loc['site'] . '/' . $loc['role'];
+                $breakdown[$loc['site']][$loc['role']] = ($breakdown[$loc['site']][$loc['role']] ?? 0) + $loc['count'];
+                $sum += $loc['count'];
+            }
+            $sigs[] = [
+                'count' => $sum, 'level' => $g['level'],
+                'severity' => $g['fatal'] ? 'critical' : ($g['level'] === 'warning' ? 'medium' : 'high'),
+                'locations' => $locs ?: ['unknown/admin'],
+                'signature' => $g['template'],
+            ];
+            $sev = $g['fatal'] ? 'critical' : ($g['level'] === 'warning' ? 'medium' : 'high');
+            $row = [
+                'id' => 'sig-' . substr(hash('sha256', $g['level'] . "\n" . $g['template']), 0, 12),
+                'severity' => $sev,
+                'title' => '"' . $g['template'] . '" errors came up ' . $sum . ' times',
+                'count' => $sum,
+            ];
+            if ($breakdown) {
+                $row['breakdown'] = $breakdown;
+            }
+            $detail = IrisPatterns::match(null, null, $g['template']);
+            if ($detail !== null) {
+                $row['detail'] = $detail;
+            }
+            $urgent[] = $row;
+            $n++;
+        }
+        unset($n);
         usort($sigs, fn($a, $b) => $b['count'] <=> $a['count']);
+        $sigRank = [];
         foreach ($sigs as $i => &$s) {
             $s = ['rank' => $i + 1] + $s;
+            $sigRank[$s['signature']] = $i + 1;
         }
         unset($s);
 
         $gaps = [];
+        $timedOut = [];
         foreach ($failures as $i => $f) {
             $site = (string)$f['site'];
             $role = (string)$f['role'];
             $st = (string)$f['status'];
             $note($site, $role);
-            $kind = str_contains($st, 'timeout') ? 'timeout' : 'visibility';
-            if ($site !== '-' && $role !== '-' && isset($roleRows[$site][$role])) {
-                $roleRows[$site][$role]['status'] = $kind === 'timeout' ? 'timeout' : (str_contains($st, 'reset') ? 'reset' : 'unreachable');
+            if (str_contains($st, 'timeout') && $site !== '-' && $role !== '-' && $role !== '') {
+                if (isset($roleRows[$site][$role])) {
+                    $roleRows[$site][$role]['status'] = 'timeout';
+                    $roleRows[$site][$role]['error'] = ['type' => 'timeout', 'limit_seconds' => $totalTimeout];
+                }
+                $timedOut[] = $site . '/' . $role;
+                continue;
             }
-            $gaps[] = ['type' => $kind, 'note' => 'scan failure: ' . $st] + ($role !== '-' ? ['roles' => [$role]] : []);
+            $kind = 'visibility';
+            if ($site !== '-' && $role !== '-' && isset($roleRows[$site][$role])) {
+                $roleRows[$site][$role]['status'] = str_contains($st, 'reset') ? 'reset' : 'unreachable';
+            }
+            $gaps[] = ['type' => $kind, 'note' => 'scan failure: ' . $st] + ($role !== '-' && $role !== '' ? ['roles' => [$role]] : []);
             $urgent[] = ['id' => 'failure-' . $i, 'severity' => 'high', 'title' => 'Scan failure: ' . $st];
         }
+        if ($timedOut) {
+            $rolesOnly = array_map(static fn(string $sr): string => explode('/', $sr, 2)[1], $timedOut);
+            $pattern = count(array_unique($rolesOnly)) === 1 ? IrisPatterns::match($rolesOnly[0], 'timeout', null) : null;
+            $gaps[] = [
+                'type' => 'timeout',
+                'roles' => $timedOut,
+                'note' => $pattern ?? ('Read timed out on ' . implode(', ', $timedOut) . '.'),
+            ];
+        }
+
+        foreach ($run['quiet'] ?? [] as $q) {
+            if (!is_array($q)) {
+                continue;
+            }
+            $site = (string)($q['site'] ?? '');
+            $role = (string)($q['role'] ?? '');
+            $note($site, $role);
+            if (!isset($roleRows[$site][$role])) {
+                continue;
+            }
+            $epoch = $q['epoch'] ?? null;
+            if (is_int($epoch) && $epoch > 0) {
+                $dt = (new \DateTimeImmutable('@' . $epoch))->setTimezone(new \DateTimeZone('Asia/Manila'));
+                $roleRows[$site][$role]['log_last_write_clock'] = [
+                    'time' => $dt->format('Y-m-d\TH:i:sP'),
+                    'timezone' => 'Asia/Manila',
+                    'note' => 'stopped writing',
+                ];
+            } else {
+                $roleRows[$site][$role]['log_last_write_clock'] = ['note' => 'last write time unknown'];
+            }
+        }
+
+        $sevRank = ['critical' => 0, 'high' => 1, 'medium' => 2, 'low' => 3, 'noise' => 4];
+        usort($urgent, static function (array $a, array $b) use ($sevRank, $sigRank): int {
+            $sa = $sevRank[$a['severity'] ?? ''] ?? 9;
+            $sb = $sevRank[$b['severity'] ?? ''] ?? 9;
+            if ($sa !== $sb) {
+                return $sa <=> $sb;
+            }
+            $ca = (int)($a['count'] ?? 0);
+            $cb = (int)($b['count'] ?? 0);
+            if ($ca !== $cb) {
+                return $cb <=> $ca;
+            }
+            $rankOf = static function (array $row) use ($sigRank): int {
+                $title = (string)($row['title'] ?? '');
+                foreach ($sigRank as $sig => $rank) {
+                    if ($sig !== '' && str_contains($title, (string)$sig)) {
+                        return $rank;
+                    }
+                }
+                return PHP_INT_MAX;
+            };
+            return $rankOf($a) <=> $rankOf($b);
+        });
 
         $sites = [];
         $siteIds = array_map('strval', array_keys($sitesSeen));
@@ -153,19 +259,34 @@ final class IrisPublish
         $total = max((int)($run['servers'] ?? 0), 0);
         $fixtures = !empty($opt['fixtures']);
         $mode = (string)($run['mode'] ?? 'daily');
-        $rid = (string)($run['run_id'] ?? '');
+        $rid = self::runId((string)($run['run_id'] ?? ''), $started);
+        $region = self::region($siteIds, $opt);
+        $executor = (string)($run['executor'] ?? 'fleet-log-scan');
+        $job = [
+            'job_id' => $region . '-log-scan-' . gmdate('Ymd', $now),
+            'run_id' => $rid,
+            'requested_by' => 'scheduler',
+            'executor' => $executor,
+        ];
+        if (isset($run['model']) && is_string($run['model']) && $run['model'] !== '') {
+            $job['model'] = $run['model'];
+        }
         $doc = [
             'schema_version' => '1.0',
             'report_type' => 'fleet_log_scan',
             'run_type' => 'fleet_log_scan',
-            'job' => ['job_id' => $rid, 'run_id' => $rid, 'requested_by' => 'scheduler', 'executor' => 'fleet-log-scan'],
+            'job' => $job,
             'scope' => [
-                'region' => self::region($siteIds, $opt),
+                'region' => $region,
                 'mode' => $fixtures ? 'fixtures' : 'read_only',
                 'sites' => $siteIds,
-                'window' => ['type' => preg_match('/^[a-z_]{1,40}$/', $mode) ? $mode : 'scan', 'hours' => 0, 'end' => self::ts($now)],
+                'window' => ['type' => preg_match('/^[a-z_]{1,40}$/', $mode) ? $mode : 'scan', 'hours' => $windowHours, 'end' => self::ts($now)],
             ],
-            'timing' => ['started_at' => self::ts($started), 'finished_at' => self::ts(max($now, $started)), 'duration_seconds' => max(0, $now - $started)],
+            'timing' => [
+                'started_at' => self::ts($started), 'finished_at' => self::ts(max($now, $started)),
+                'duration_seconds' => max(0, $now - $started),
+                'timezone_note' => 'Human clock is Asia/Manila.',
+            ],
             'result' => [
                 'status' => $failed ? 'partial' : 'ok', 'exit_code' => $failed ? 5 : 0,
                 'roles_total' => $total, 'roles_ok' => max(0, $total - $failed), 'roles_failed' => $failed,
@@ -176,16 +297,64 @@ final class IrisPublish
             'top_signatures' => $sigs,
             'urgent' => $urgent,
             'coverage_gaps' => $gaps,
-            'config' => ['connect_timeout_seconds' => 0, 'total_timeout_seconds' => 0, 'byte_cap_mb_per_file' => 0, 'first_run_hours' => 0],
+            'config' => [
+                'connect_timeout_seconds' => $connectTimeout,
+                'total_timeout_seconds' => $totalTimeout,
+                'byte_cap_mb_per_file' => 0,
+                'first_run_hours' => $windowHours,
+            ],
             'safety' => [
                 'live_enabled_after_run' => false, 'state_disabled_present' => false, 'webhook_env_present' => false,
-                'launch_agent_present' => false, 'summary_model_used' => ($run['summary_status'] ?? '') === 'summary ok',
+                'launch_agent_present' => false, 'summary_model_used' => self::summaryUsed($run),
                 'delivery' => 'none', 'ipv4_in_outputs' => 0, 'secrets_in_outputs' => 0, 'server_writes' => false, 'sudo_used' => false,
             ],
             'artifacts' => ['report_md' => null, 'tool_report' => $rid !== '' ? $rid . '.txt' : null],
             'suggested_fixes' => [],
         ];
+        if (self::summaryUsed($run)) {
+            $doc['ai_summary'] = $run['ai_summary'];
+        }
         return self::finish(self::augment2($doc));
+    }
+
+    /** Keep a valid id. Otherwise emit YYYYMMDDTHHMMSSZ-hex from the start time. */
+    private static function runId(string $rid, int $started): string
+    {
+        if (preg_match('/^[0-9]{8}T[0-9]{6}Z?-[0-9a-f]{4,12}$/', $rid) === 1) {
+            return $rid;
+        }
+        $hex = substr(hash('sha256', $rid !== '' ? $rid : 'run'), 0, 8);
+        return gmdate('Ymd\THis\Z', $started) . '-' . $hex;
+    }
+
+    /** The old digest's "summary ok" is not an Iris model attachment. */
+    private static function summaryUsed(array $run): bool
+    {
+        $ai = $run['ai_summary'] ?? null;
+        return is_array($ai)
+            && ($ai['status'] ?? '') === 'ok'
+            && ($ai['model'] ?? '') === 'grok-4.7-high'
+            && is_string($ai['text'] ?? null)
+            && $ai['text'] !== '';
+    }
+
+    /** Write the final document once. A later call returns those bytes. */
+    public static function remember(string $path, array $doc, bool $replace = false): array
+    {
+        if (!$replace && is_file($path)) {
+            $saved = json_decode((string)file_get_contents($path), true);
+            if (is_array($saved)) {
+                return $saved;
+            }
+        }
+        $dir = dirname($path);
+        if (!is_dir($dir)) {
+            Fs::ensureDir($dir);
+        }
+        $raw = json_encode($doc, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+        Fs::writeSecure($path, $raw);
+        $again = json_decode($raw, true);
+        return is_array($again) ? $again : $doc;
     }
 
     /** Slash-prefix and path rules for a freshly built document, without resetting the drop counter. */
@@ -320,4 +489,57 @@ final class IrisPublish
         unset($doc['payload_hash']);
         return hash('sha256', self::canonical($doc));
     }
+
+    /** A summary 422 is the only failure that is posted again, once, as skipped. */
+    public static function summaryRejected(array $result): bool
+    {
+        if ((int)($result['code'] ?? 0) !== 422) {
+            return false;
+        }
+        $body = $result['body'] ?? '';
+        $json = is_array($body) ? $body : json_decode((string)$body, true);
+        if (!is_array($json)) {
+            return false;
+        }
+        $violations = $json['violations'] ?? [];
+        if (!is_array($violations)) {
+            return false;
+        }
+        foreach ($violations as $v) {
+            if (!is_array($v)) {
+                continue;
+            }
+            $ptr = (string)($v['pointer'] ?? '');
+            $rule = (string)($v['rule'] ?? $v['class'] ?? '');
+            if (str_starts_with($ptr, '/ai_summary') || $rule === 'summary_untraced') {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    public static function asSkipped(array $doc): array
+    {
+        $doc['ai_summary'] = ['status' => 'skipped', 'text' => null, 'model' => null];
+        if (!isset($doc['safety']) || !is_array($doc['safety'])) {
+            $doc['safety'] = [];
+        }
+        $doc['safety']['summary_model_used'] = false;
+        unset($doc['payload_hash']);
+        $doc['payload_hash'] = self::hash($doc);
+        return $doc;
+    }
+
+    /** @param callable(array): array{code:int,body:mixed} $client */
+    public static function deliver(string $path, array $doc, callable $client): array
+    {
+        $sent = self::remember($path, $doc);
+        $first = $client($sent);
+        if (!self::summaryRejected($first)) {
+            return ['posts' => 1, 'result' => $first, 'doc' => $sent];
+        }
+        $sent = self::remember($path, self::asSkipped($sent), true);
+        return ['posts' => 2, 'result' => $client($sent), 'doc' => $sent];
+    }
 }
+

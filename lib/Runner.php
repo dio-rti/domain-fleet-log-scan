@@ -13,7 +13,7 @@ final class Runner
     public function __construct(private array $cfg, private array $opt)
     {
         $this->now = $opt['now'] ?? time();
-        $this->runId = Tz::manila($this->now, 'Ymd\THis') . '-' . bin2hex(random_bytes(3));
+        $this->runId = gmdate('Ymd\THis\Z', $this->now) . '-' . bin2hex(random_bytes(4));
         $this->scratch = $cfg['data_dir'] . '/scratch/' . $this->runId;
     }
 
@@ -195,6 +195,7 @@ final class Runner
         }
 
         $flags = [];
+        $quiet = [];
         $observations = [];
         $info = [];
         $baselineSites = [];
@@ -282,13 +283,16 @@ final class Runner
                     $lastE = $prev ?: null;
                 }
                 $since = $lastE ? Tz::manila($lastE, 'H:i') : 'unknown';
+                $clock = (is_int($lastE) && $lastE > 0) ? $lastE : null;
                 if ($f['entries'] === 0) {
+                    $quiet[] = ['site' => (string)$site, 'role' => (string)$role, 'epoch' => $clock];
                     if (isset($svc[$role]) && $active) {
                         $observations[] = sprintf('%s %s possibly out of rotation (quiet since %s; %s active)', $site, $role, $since, implode(', ', $active));
                     } else {
                         $info[] = "$site $role app.log quiet (info only: these logs hold only warnings and errors)";
                     }
                 } elseif ($f['entries'] >= 20 && $lastE !== null && $lastE < $this->now - 3 * 3600 && ($roleHours[$role] ?? 0) >= 6) {
+                    $quiet[] = ['site' => (string)$site, 'role' => (string)$role, 'epoch' => $clock];
                     $observations[] = sprintf('%s %s app.log stopped at %s after steady activity', $site, $role, Tz::manila($lastE, 'H:i'));
                 }
             }
@@ -318,7 +322,9 @@ final class Runner
         $sourceProblem = $listPartial || (bool)array_filter($notes, fn($n) => str_starts_with($n, 'site list: global CLI') && str_contains($n, 'include list'));
         $run = [
             'run_id' => $this->runId, 'mode' => $this->opt['mode'], 'started' => $this->now, 'servers' => $serverCount,
-            'flags' => $flags, 'failures' => $failures, 'observations' => $observations, 'notes' => array_values(array_unique($notes)),
+            'flags' => $flags, 'failures' => $failures, 'quiet' => $quiet, 'observations' => $observations, 'notes' => array_values(array_unique($notes)),
+            'connect_timeout' => (int)$cfg['timeouts']['connect'], 'total_timeout' => (int)$cfg['timeouts']['total'],
+            'window_hours' => (int)$cfg['first_run_hours'], 'executor' => 'fleet-log-scan',
             'baseline_sites' => $baselineSites, 'baseline_groups' => $baselineGroups,
             'payload_versions' => ['scan-v1.sh' => $phash],
         ];
@@ -414,7 +420,28 @@ final class Runner
         if ($this->fixtures() !== null && !$wh->isLoopback()) {
             return 'webhook not sent: fixtures mode only posts to a loopback URL';
         }
-        $st = $wh->mask($wh->post($payload));
+        if ($iris) {
+            if (!empty($this->opt['iris_summary'])) {
+                $attached = IrisSummary::attach($payload, [
+                    'log' => $this->cfg['data_dir'] . '/reports/' . $this->runId . '.iris-summary.log',
+                ]);
+                $payload = $attached['doc'];
+                if ($attached['reason'] !== null) {
+                    $this->say('iris summary: skipped');
+                }
+            }
+            $safe = preg_replace('/[^0-9A-Za-zT_-]/', '', (string)($payload['job']['run_id'] ?? $run['run_id']));
+            $path = $this->cfg['data_dir'] . '/reports/' . $safe . '.iris.json';
+            $payload = IrisPublish::remember($path, $payload);
+            $res = $wh->postResult($payload);
+            if (IrisPublish::summaryRejected($res)) {
+                $payload = IrisPublish::remember($path, IrisPublish::asSkipped($payload), true);
+                $res = $wh->postResult($payload);
+            }
+            $st = $wh->mask($res['status']);
+        } else {
+            $st = $wh->mask($wh->post($payload));
+        }
         $this->say($st);
         return $st;
     }

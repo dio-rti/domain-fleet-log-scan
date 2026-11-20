@@ -16,7 +16,7 @@ ini_set('display_errors', 'stderr');
 error_reporting(E_ALL);
 
 const TOOL_DIR = __DIR__;
-foreach (['Util', 'Redact', 'Config', 'Payload', 'Sites', 'Pool', 'Tsv', 'State', 'Diff', 'Outputs', 'IrisPublish', 'Runner'] as $f) {
+foreach (['Util', 'Redact', 'Config', 'Payload', 'Sites', 'Pool', 'Tsv', 'State', 'Diff', 'Outputs', 'IrisPatterns', 'IrisPublish', 'SummaryNumberTrace', 'IrisSummaryVerifier', 'IrisSummary', 'Runner'] as $f) {
     require_once TOOL_DIR . '/lib/' . $f . '.php';
 }
 
@@ -33,6 +33,7 @@ Usage:
   add --webhook-dry-run                              print the webhook JSON instead of POSTing
   add --webhook-always                               send the webhook even on a quiet day
   add --iris-publish [--iris-sg <file>]              publish Iris ingest v1 instead of webhook.v1 (default off; quiet days publish too)
+  add --iris-summary                                 with --iris-publish, attach a verified grok-4.7-high summary (default off)
 Other: --config <file>  --per-run-ok (live trace only, after Dio approves)  --print-payload-hashes  --lint-payloads
 Fixtures-only: --now <epoch>  --stagger <s>
 Live SSH runs are refused unless config live.enabled is true (needs Dio's OK).
@@ -62,6 +63,7 @@ function parseArgs(array $argv): array
             case '--webhook-dry-run': $o['webhook_dry_run'] = true; break;
             case '--webhook-always': $o['webhook_always'] = true; break;
             case '--iris-publish': $o['iris_publish'] = true; break;
+            case '--iris-summary': $o['iris_summary'] = true; break;
             case '--iris-sg': $o['iris_sg'] = $need($i); break;
             case '--config': $o['config'] = $need($i); break;
             case '--per-run-ok': $o['per_run_ok'] = true; break;
@@ -78,6 +80,9 @@ function parseArgs(array $argv): array
     }
     if (isset($o['iris_sg']) && empty($o['iris_publish'])) {
         throw new FlsException('--iris-sg is only allowed with --iris-publish', 2);
+    }
+    if (!empty($o['iris_summary']) && empty($o['iris_publish'])) {
+        throw new FlsException('--iris-summary is only allowed with --iris-publish', 2);
     }
     if (isset($o['site']) && !preg_match('/^\d{5}$/', $o['site'])) {
         throw new FlsException('--site must be a 5-digit site id', 2);
