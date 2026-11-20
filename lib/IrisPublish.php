@@ -9,7 +9,13 @@ namespace Fls;
  */
 final class IrisPublish
 {
+    private const BODY_LIMIT = 1048576 - 40960;
+    private const SEV = ['critical' => 0, 'high' => 1, 'medium' => 2, 'low' => 3, 'noise' => 4];
+    private const GAP = ['timeout' => 0, 'visibility' => 1, 'byte_cap' => 2, 'version' => 3];
+    private const LISTS = ['top_signatures', 'urgent', 'suggested_fixes', 'coverage_gaps'];
+
     private static int $dropped = 0;
+    private static array $capStats = [];
 
     /** Quiet days skip the publisher unless the flag is on. */
     public static function postsOnQuietDay(bool $flag): bool
@@ -21,6 +27,12 @@ final class IrisPublish
     public static function dropped(): int
     {
         return self::$dropped;
+    }
+
+    /** What the last cap call kept and dropped: orig/kept per list plus per-kind drop counts. */
+    public static function capStats(): array
+    {
+        return self::$capStats;
     }
 
     public static function augment(array $sg): array
@@ -308,7 +320,7 @@ final class IrisPublish
                 'launch_agent_present' => false, 'summary_model_used' => self::summaryUsed($run),
                 'delivery' => 'none', 'ipv4_in_outputs' => 0, 'secrets_in_outputs' => 0, 'server_writes' => false, 'sudo_used' => false,
             ],
-            'artifacts' => ['report_md' => null, 'tool_report' => $rid !== '' ? $rid . '.txt' : null],
+            'artifacts' => ['report_md' => null, 'tool_report' => null],
             'suggested_fixes' => [],
         ];
         if (self::summaryUsed($run)) {
@@ -424,18 +436,423 @@ final class IrisPublish
         return $out;
     }
 
-    /** Tripwire-drop strings, then set payload_hash. */
+    /** Tripwire-drop strings, cap the lists, then set payload_hash and fit the body size. */
     private static function finish(array $doc): array
     {
         $doc = self::sanitize($doc, '');
-        // A row that lost its required text is dropped whole (it would fail ingest validation).
-        foreach (['top_signatures' => 'signature', 'suggested_fixes' => 'fix_text'] as $list => $req) {
-            if (isset($doc[$list]) && is_array($doc[$list])) {
-                $doc[$list] = array_values(array_filter($doc[$list], fn($r) => is_array($r) && isset($r[$req])));
+        // Urgent rows with a title but no usable id get a deterministic digit-free id, so they survive the cap.
+        if (isset($doc['urgent']) && is_array($doc['urgent'])) {
+            $safe = static fn($id): bool => is_string($id) && preg_match('/^[A-Za-z0-9_.-]{1,64}$/', $id) === 1 && !preg_match('/\d{7}/', $id);
+            $used = [];
+            foreach ($doc['urgent'] as $i => $r) {
+                if (is_array($r) && isset($r['title']) && $safe($r['id'] ?? null) && !isset($used[$r['id']])) {
+                    $used[$r['id']] = true;
+                    $doc['urgent'][$i]['_keep'] = true;
+                }
+            }
+            foreach ($doc['urgent'] as $i => $r) {
+                if (!is_array($r) || !isset($r['title'])) {
+                    continue;
+                }
+                if (isset($r['_keep'])) {
+                    unset($doc['urgent'][$i]['_keep']);
+                    continue;
+                }
+                $h = hash('sha256', json_encode([$r['severity'] ?? null, $r['title'], $r['count'] ?? null]));
+                $id = 'u' . substr(strtr($h, '0123456789', 'ghijklmnop'), 0, 40);
+                while (isset($used[$id])) {
+                    $id .= 'x';
+                }
+                $used[$id] = true;
+                $doc['urgent'][$i]['id'] = $id;
             }
         }
+        // A row that lost its required text is dropped whole (it would fail ingest validation).
+        $need = ['top_signatures' => ['signature'], 'suggested_fixes' => ['fix_text'], 'urgent' => ['id', 'title']];
+        foreach ($need as $list => $keys) {
+            if (isset($doc[$list]) && is_array($doc[$list])) {
+                $doc[$list] = array_values(array_filter($doc[$list], fn($r) => is_array($r) && count(array_filter($keys, fn($k) => isset($r[$k]))) === count($keys)));
+            }
+        }
+        $doc = self::cap($doc);
         unset($doc['payload_hash']);
         $doc['payload_hash'] = self::hash($doc);
+        return self::fit($doc);
+    }
+
+    private static function cap(array $doc): array
+    {
+        $st = ['orig' => [], 'kept' => [], 'n' => array_fill_keys(['loc', 'role', 'hit', 'site', 'cut', 'aff'], 0), 'base' => null];
+        $n = &$st['n'];
+        $n['cut'] = self::cutText($doc);
+        $base = $doc['result']['flagged_note'] ?? null;
+        $st['base'] = is_string($base) ? $base : null;
+        foreach (self::LISTS as $l) {
+            $st['orig'][$l] = count(self::rows($doc, $l));
+        }
+        $keep = self::capScope($doc, $n);
+        self::capSites($doc, $keep, $n);
+        $had = array_filter(self::LISTS, fn($l) => array_key_exists($l, $doc));
+        $new = [
+            'top_signatures' => self::capSigs($doc, $keep, $n),
+            'urgent' => self::capUrgent($doc),
+        ];
+        $doc['urgent'] = $new['urgent'];
+        $new['suggested_fixes'] = self::capFixes($doc, $keep, $n);
+        $new['coverage_gaps'] = self::capGaps($doc);
+        foreach (self::LISTS as $l) {
+            $st['kept'][$l] = count($new[$l]);
+            if (in_array($l, $had, true)) {
+                $doc[$l] = $new[$l];
+            } else {
+                unset($doc[$l]);
+            }
+        }
+        unset($n);
+        self::$capStats = $st;
+        return self::record($doc, $st);
+    }
+
+    /** @return list<mixed> */
+    private static function rows(array $doc, string $key): array
+    {
+        return is_array($doc[$key] ?? null) ? array_values($doc[$key]) : [];
+    }
+
+    private static function sevOf(mixed $row): int
+    {
+        return self::SEV[is_array($row) ? (string)($row['severity'] ?? '') : ''] ?? 9;
+    }
+
+    private static function cutFields(mixed &$row, array $limits): int
+    {
+        $n = 0;
+        foreach ($limits as $k => $max) {
+            if (is_array($row) && isset($row[$k]) && is_string($row[$k]) && mb_strlen($row[$k]) > $max) {
+                $row[$k] = mb_substr($row[$k], 0, $max);
+                $n++;
+            }
+        }
+        return $n;
+    }
+
+    /** Free-text fields are cut to their schema maxLength. Identifier fields are never cut. */
+    private static function cutText(array &$doc): int
+    {
+        $n = 0;
+        $top = ['result' => ['flagged_note' => 500, 'exit_reason' => 500], 'timing' => ['timezone_note' => 200]];
+        foreach ($top as $k => $lim) {
+            $n += isset($doc[$k]) ? self::cutFields($doc[$k], $lim) : 0;
+        }
+        $lists = [
+            'top_signatures' => ['signature' => 2000],
+            'urgent' => ['title' => 200, 'detail' => 2000, 'caveat' => 500],
+            'suggested_fixes' => ['fix_text' => 2000],
+            'coverage_gaps' => ['note' => 1000, 'fix' => 1000],
+        ];
+        foreach ($lists as $list => $lim) {
+            foreach (array_keys(self::rows($doc, $list)) as $i) {
+                $n += self::cutFields($doc[$list][$i], $lim);
+            }
+        }
+        foreach (array_keys(self::rows($doc, 'sites')) as $i) {
+            foreach (array_keys(self::rows($doc['sites'][$i] ?? [], 'roles')) as $j) {
+                $n += self::cutRole($doc['sites'][$i]['roles'][$j]);
+            }
+        }
+        if (isset($doc['artifacts']['tool_report']) && is_string($doc['artifacts']['tool_report']) && preg_match('/[0-9]{7,}/', $doc['artifacts']['tool_report']) === 1) {
+            $doc['artifacts']['tool_report'] = null;
+            $n++;
+        }
+        return $n;
+    }
+
+    private static function cutRole(mixed &$role): int
+    {
+        $n = 0;
+        foreach (['error' => ['detail' => 500], 'log_last_write_clock' => ['note' => 200]] as $k => $lim) {
+            $n += is_array($role) && isset($role[$k]) ? self::cutFields($role[$k], $lim) : 0;
+        }
+        return $n;
+    }
+
+    /** @return ?list<string> the kept scope.sites, or null when the document has none */
+    private static function capScope(array &$doc, array &$n): ?array
+    {
+        $sites = $doc['scope']['sites'] ?? null;
+        if (!is_array($sites)) {
+            return null;
+        }
+        $sites = array_values($sites);
+        if (count($sites) > 500) {
+            sort($sites, SORT_STRING);
+            $n['site'] += count($sites) - 500;
+            $sites = array_slice($sites, 0, 500);
+            $doc['scope']['sites'] = $sites;
+        }
+        return array_map('strval', $sites);
+    }
+
+    private static function capSites(array &$doc, ?array $keep, array &$n): void
+    {
+        if ($keep === null || !is_array($doc['sites'] ?? null)) {
+            return;
+        }
+        $pos = array_flip($keep);
+        $rows = array_values(array_filter($doc['sites'], fn($s) => is_array($s) && isset($s['site_id']) && is_scalar($s['site_id']) && isset($pos[(string)$s['site_id']])));
+        $n['site'] += count($doc['sites']) - count($rows);
+        usort($rows, fn($a, $b) => $pos[(string)$a['site_id']] <=> $pos[(string)$b['site_id']]);
+        if (count($rows) > 500) {
+            $n['site'] += count($rows) - 500;
+            $rows = array_slice($rows, 0, 500);
+        }
+        foreach ($rows as $i => $site) {
+            $rows[$i] = self::capRoles($site, $n);
+        }
+        $doc['sites'] = $rows;
+    }
+
+    private static function capRoles(array $site, array &$n): array
+    {
+        if (!is_array($site['roles'] ?? null)) {
+            return $site;
+        }
+        $roles = array_values($site['roles']);
+        if (count($roles) > 50) {
+            usort($roles, fn($a, $b) => [(($a['status'] ?? '') === 'ok') ? 1 : 0, (string)($a['role'] ?? '')] <=> [(($b['status'] ?? '') === 'ok') ? 1 : 0, (string)($b['role'] ?? '')]);
+            $n['role'] += count($roles) - 50;
+            $roles = array_slice($roles, 0, 50);
+        }
+        foreach ($roles as $j => $role) {
+            if (is_array($role) && is_array($role['byte_cap_hits'] ?? null) && count($role['byte_cap_hits']) > 50) {
+                $hits = array_values($role['byte_cap_hits']);
+                usort($hits, fn($a, $b) => [-(float)($a['skipped_mb'] ?? 0), (string)($a['file'] ?? '')] <=> [-(float)($b['skipped_mb'] ?? 0), (string)($b['file'] ?? '')]);
+                $n['hit'] += count($hits) - 50;
+                $roles[$j]['byte_cap_hits'] = array_slice($hits, 0, 50);
+            }
+        }
+        $site['roles'] = $roles;
+        return $site;
+    }
+
+    /** @return list<array<string,mixed>> */
+    private static function capSigs(array $doc, ?array $keep, array &$n): array
+    {
+        $pos = $keep === null ? null : array_flip($keep);
+        $rows = [];
+        foreach (self::rows($doc, 'top_signatures') as $sig) {
+            $sig = self::capLocations($sig, $pos, $n);
+            if ($sig !== null) {
+                $rows[] = $sig;
+            }
+        }
+        usort($rows, fn($a, $b) => [-(int)($a['count'] ?? 0), self::sevOf($a), (string)$a['signature'], (string)($a['level'] ?? '')] <=> [-(int)($b['count'] ?? 0), self::sevOf($b), (string)$b['signature'], (string)($b['level'] ?? '')]);
+        $rows = array_slice(self::uniqueSigs($rows), 0, 500);
+        return self::renumber($rows);
+    }
+
+    private static function capLocations(mixed $sig, ?array $pos, array &$n): ?array
+    {
+        if (!is_array($sig)) {
+            return null;
+        }
+        $locs = is_array($sig['locations'] ?? null) ? array_values($sig['locations']) : [];
+        $before = count($locs);
+        if ($pos !== null) {
+            $locs = array_values(array_filter($locs, fn($l) => is_string($l) && isset($pos[explode('/', $l, 2)[0]])));
+        }
+        $locs = array_slice($locs, 0, 500);
+        $n['loc'] += $before - count($locs);
+        $sig['locations'] = $locs;
+        return $locs ? $sig : null;
+    }
+
+    /** Drop a later row whose level + signature repeats an earlier one. */
+    private static function uniqueSigs(array $rows): array
+    {
+        $seen = [];
+        $out = [];
+        foreach ($rows as $r) {
+            $k = (string)($r['level'] ?? '') . "\n" . $r['signature'];
+            if (!isset($seen[$k])) {
+                $seen[$k] = true;
+                $out[] = $r;
+            }
+        }
+        return $out;
+    }
+
+    private static function renumber(array $rows): array
+    {
+        foreach ($rows as $i => $r) {
+            $rows[$i]['rank'] = $i + 1;
+        }
+        return $rows;
+    }
+
+    private static function capUrgent(array $doc): array
+    {
+        $rows = array_values(array_filter(self::rows($doc, 'urgent'), 'is_array'));
+        usort($rows, fn($a, $b) => [self::sevOf($a), -(int)($a['count'] ?? 0), (string)$a['id']] <=> [self::sevOf($b), -(int)($b['count'] ?? 0), (string)$b['id']]);
+        return array_slice($rows, 0, 200);
+    }
+
+    private static function capFixes(array $doc, ?array $keep, array &$n): array
+    {
+        $ids = array_flip(array_map(fn($u) => (string)$u['id'], self::rows($doc, 'urgent')));
+        $pos = $keep === null ? null : array_flip($keep);
+        $rows = array_values(array_filter(self::rows($doc, 'suggested_fixes'), 'is_array'));
+        foreach ($rows as $i => $fx) {
+            $rows[$i] = self::capAffected($fx, $pos, $n);
+        }
+        $pref = fn($f) => (isset($ids[(string)($f['issue_ref'] ?? '')]) || str_starts_with((string)($f['issue_ref'] ?? ''), 'gap-')) ? 0 : 1;
+        usort($rows, fn($a, $b) => [$pref($a), self::sevOf($a), -(float)($a['confidence'] ?? 0), (string)($a['issue_ref'] ?? '')] <=> [$pref($b), self::sevOf($b), -(float)($b['confidence'] ?? 0), (string)($b['issue_ref'] ?? '')]);
+        return array_slice($rows, 0, 200);
+    }
+
+    private static function capAffected(array $fx, ?array $pos, array &$n): array
+    {
+        if (!is_array($fx['affected'] ?? null)) {
+            return $fx;
+        }
+        $aff = array_values($fx['affected']);
+        $before = count($aff);
+        if ($pos !== null) {
+            $aff = array_values(array_filter($aff, fn($a) => is_array($a) && isset($a['site_id']) && is_scalar($a['site_id']) && isset($pos[(string)$a['site_id']])));
+        }
+        usort($aff, fn($a, $b) => strcmp((string)($a['site_id'] ?? ''), (string)($b['site_id'] ?? '')));
+        $aff = array_slice($aff, 0, 500);
+        $n['aff'] += $before - count($aff);
+        $fx['affected'] = $aff;
+        return $fx;
+    }
+
+    private static function capGaps(array $doc): array
+    {
+        $rows = array_values(array_filter(self::rows($doc, 'coverage_gaps'), 'is_array'));
+        usort($rows, fn($a, $b) => (self::GAP[(string)($a['type'] ?? '')] ?? 9) <=> (self::GAP[(string)($b['type'] ?? '')] ?? 9));
+        return array_slice($rows, 0, 200);
+    }
+
+    private static function changed(array $st): bool
+    {
+        foreach (self::LISTS as $l) {
+            if ($st['kept'][$l] < $st['orig'][$l]) {
+                return true;
+            }
+        }
+        return array_sum($st['n']) > 0;
+    }
+
+    /** One fixed sentence from the pre-cap totals. No run data in it. */
+    private static function sentence(array $st): string
+    {
+        [$o, $k, $n] = [$st['orig'], $st['kept'], $st['n']];
+        $s = 'Iris caps: kept ' . $k['top_signatures'] . ' of ' . $o['top_signatures'] . ' signatures, ' . $k['urgent'] . ' of ' . $o['urgent'] . ' urgent';
+        if ($k['suggested_fixes'] < $o['suggested_fixes']) {
+            $s .= ', kept ' . $k['suggested_fixes'] . ' of ' . $o['suggested_fixes'] . ' fixes';
+        }
+        if ($k['coverage_gaps'] < $o['coverage_gaps']) {
+            $s .= ', kept ' . $k['coverage_gaps'] . ' of ' . $o['coverage_gaps'] . ' gaps';
+        }
+        foreach (['loc' => 'dropped %d locations', 'role' => 'dropped %d roles', 'hit' => 'dropped %d byte-cap hits', 'site' => 'dropped %d sites', 'cut' => 'truncated %d fields'] as $key => $fmt) {
+            $s .= $n[$key] > 0 ? ', ' . sprintf($fmt, $n[$key]) : '';
+        }
+        return $s . '.';
+    }
+
+    /** Write groups_recorded and flagged_note, only when this call changed something. */
+    private static function record(array $doc, array $st): array
+    {
+        if (!self::changed($st) || !is_array($doc['result'] ?? null)) {
+            return $doc;
+        }
+        $base = (string)$st['base'];
+        $new = self::sentence($st);
+        $doc['result']['flagged_note'] = $base === '' ? $new : (mb_strlen($base . ' ' . $new) <= 500 ? $base . ' ' . $new : $base);
+        if ($st['kept']['top_signatures'] < $st['orig']['top_signatures']) {
+            $doc['result']['groups_recorded'] = $st['orig']['top_signatures'];
+        }
+        return $doc;
+    }
+
+    private static function bodySize(array $doc): int
+    {
+        return strlen((string)json_encode($doc, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE));
+    }
+
+    /** Drop one chunk from the end of sites: byte-cap hits, then roles, then the site itself. False when nothing is left. */
+    private static function dropSiteChunk(array &$doc, array &$n): bool
+    {
+        if (!is_array($doc['sites'] ?? null) || !$doc['sites']) {
+            return false;
+        }
+        $chunk = fn(int $c): int => max(1, (int)ceil($c / 10));
+        $sites = array_keys($doc['sites']);
+        for ($a = count($sites) - 1; $a >= 0; $a--) {
+            $si = $sites[$a];
+            if (!is_array($doc['sites'][$si]['roles'] ?? null)) {
+                continue;
+            }
+            $roles = array_keys($doc['sites'][$si]['roles']);
+            for ($b = count($roles) - 1; $b >= 0; $b--) {
+                $ri = $roles[$b];
+                $hits = $doc['sites'][$si]['roles'][$ri]['byte_cap_hits'] ?? null;
+                if (is_array($hits) && $hits) {
+                    $k = $chunk(count($hits));
+                    $doc['sites'][$si]['roles'][$ri]['byte_cap_hits'] = array_slice(array_values($hits), 0, count($hits) - $k);
+                    $n['hit'] += $k;
+                    return true;
+                }
+            }
+        }
+        for ($a = count($sites) - 1; $a >= 0; $a--) {
+            $si = $sites[$a];
+            $roles = $doc['sites'][$si]['roles'] ?? null;
+            if (is_array($roles) && $roles) {
+                $k = $chunk(count($roles));
+                $doc['sites'][$si]['roles'] = array_slice(array_values($roles), 0, count($roles) - $k);
+                $n['role'] += $k;
+                return true;
+            }
+        }
+        $last = array_pop($doc['sites']);
+        $n['site']++;
+        $id = is_array($last) && isset($last['site_id']) && is_scalar($last['site_id']) ? (string)$last['site_id'] : null;
+        if ($id !== null && is_array($doc['scope']['sites'] ?? null)) {
+            $doc['scope']['sites'] = array_values(array_filter($doc['scope']['sites'], fn($s) => (string)$s !== $id));
+        }
+        return true;
+    }
+
+    /** Drop items from the end until the body fits under the limit; rehash every round. */
+    private static function fit(array $doc): array
+    {
+        $st = self::$capStats;
+        while (self::bodySize($doc) > self::BODY_LIMIT) {
+            $list = null;
+            foreach (self::LISTS as $l) {
+                if (is_array($doc[$l] ?? null) && $doc[$l]) {
+                    $list = $l;
+                    break;
+                }
+            }
+            if ($list === null) {
+                if (!self::dropSiteChunk($doc, $st['n'])) {
+                    break;
+                }
+            } else {
+                $doc[$list] = array_slice($doc[$list], 0, count($doc[$list]) - max(1, (int)ceil(count($doc[$list]) / 10)));
+                if ($list === 'top_signatures') {
+                    $doc[$list] = self::renumber($doc[$list]);
+                }
+                $st['kept'][$list] = count($doc[$list]);
+            }
+            $doc = self::record($doc, $st);
+            unset($doc['payload_hash']);
+            $doc['payload_hash'] = self::hash($doc);
+        }
+        self::$capStats = $st;
         return $doc;
     }
 

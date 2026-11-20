@@ -288,6 +288,168 @@ $t(count($other) === 1, 'a non-summary 422 is not retried');
 @unlink($postDir . '/two.iris.json');
 @rmdir($postDir);
 
+
+// ---- Iris publish cap (synthetic documents only) ----
+$capDoc = static function (array $over = []): array {
+    $sigs = [];
+    for ($i = 0; $i <= 500; $i++) {
+        $locs = $i === 0 ? ['11111/admin', 'NOSUCH/admin'] : ['11111/admin'];
+        $sigs[] = ['rank' => $i + 1, 'count' => 1000 - $i, 'level' => 'warning', 'severity' => 'medium', 'locations' => $locs, 'signature' => sprintf('tmpl-%04d', $i)];
+    }
+    $urgent = [];
+    for ($i = 0; $i < 200; $i++) {
+        $urgent[] = ['id' => sprintf('u-%04d', $i), 'severity' => 'critical', 'title' => sprintf('Urgent row %04d', $i), 'count' => 1];
+    }
+    $urgent[] = ['id' => 'u-big', 'severity' => 'medium', 'title' => 'Big but medium', 'count' => 999];
+    $doc = [
+        'schema_version' => '1.0', 'report_type' => 'fleet_log_scan',
+        'job' => ['job_id' => 'sg-log-scan-20261120', 'run_id' => '20261120T080000Z-abc123', 'requested_by' => 'scheduler'],
+        'scope' => ['region' => 'sg', 'mode' => 'read_only', 'sites' => ['11111'],
+            'window' => ['type' => 'daily', 'hours' => 24, 'end' => '2026-11-20T02:15:00Z']],
+        'timing' => ['started_at' => '2026-11-20T02:15:00Z', 'finished_at' => '2026-11-20T02:16:00Z', 'duration_seconds' => 60],
+        'result' => ['status' => 'ok', 'exit_code' => 0, 'roles_total' => 1, 'roles_ok' => 1, 'roles_failed' => 0, 'flagged_new_groups' => 3],
+        'totals' => ['errors' => 5, 'warnings' => 7, 'fatals' => 0, 'http_500_bursts' => 0],
+        'sites' => [['site_id' => '11111', 'roles_total' => 1, 'roles_ok' => 1, 'errors' => 5, 'warnings' => 7,
+            'roles' => [['role' => 'admin', 'status' => 'ok', 'duration_seconds' => 3, 'checkpoint_saved' => true]]]],
+        'top_signatures' => $sigs,
+        'urgent' => $urgent,
+        'coverage_gaps' => [],
+        'config' => ['connect_timeout_seconds' => 5, 'total_timeout_seconds' => 60, 'byte_cap_mb_per_file' => 50, 'first_run_hours' => 24],
+        'safety' => ['live_enabled_after_run' => false, 'state_disabled_present' => false, 'webhook_env_present' => false,
+            'launch_agent_present' => false, 'summary_model_used' => false, 'delivery' => 'none', 'ipv4_in_outputs' => 0,
+            'secrets_in_outputs' => 0, 'server_writes' => false, 'sudo_used' => false],
+        'artifacts' => ['report_md' => null, 'tool_report' => 'scan-20261120.txt'],
+        'suggested_fixes' => [],
+    ];
+    return $over + $doc;
+};
+$limit = 1048576 - 40960;
+$body = static fn(array $d): int => strlen((string)json_encode($d, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE));
+$dupes = static function (array $d): bool {
+    $keys = array_map(fn($r) => $r['level'] . "\n" . $r['signature'], $d['top_signatures']);
+    $ids = array_column($d['urgent'], 'id');
+    return count($keys) !== count(array_unique($keys)) || count($ids) !== count(array_unique($ids));
+};
+
+$big = IrisPublish::augment($capDoc());
+$t(count($big['top_signatures']) === 500 && array_column($big['top_signatures'], 'rank') === range(1, 500), 'cap: 500 signatures ranked 1..500');
+$t($big['top_signatures'][0]['signature'] === 'tmpl-0000' && $big['top_signatures'][0]['locations'] === ['11111/admin'], 'cap: first signature kept, bad location dropped');
+$t(count($big['urgent']) === 200 && array_unique(array_column($big['urgent'], 'severity')) === ['critical'] && !in_array('u-big', array_column($big['urgent'], 'id'), true), 'cap: 200 critical urgent, u-big dropped');
+$t(($big['result']['groups_recorded'] ?? 0) === 501, 'cap: groups_recorded is the pre-cap count');
+$note = (string)($big['result']['flagged_note'] ?? '');
+$t(str_starts_with($note, 'Iris caps: kept 500 of 501 signatures, 200 of 201 urgent') && str_contains($note, 'truncated 1') && mb_strlen($note) <= 500, 'cap: flagged_note sentence');
+$t($big['totals'] === ['errors' => 5, 'warnings' => 7, 'fatals' => 0, 'http_500_bursts' => 0] && $big['result']['flagged_new_groups'] === 3 && $big['result']['roles_total'] === 1, 'cap: totals unchanged');
+$t($big['artifacts']['tool_report'] === null, 'cap: digit-run tool_report cleared');
+$t($big['payload_hash'] === IrisPublish::hash($big) && $body($big) <= $limit, 'cap: hash matches, body fits');
+$again = IrisPublish::augment($big);
+$t($again['payload_hash'] === $big['payload_hash'] && $again['result']['flagged_note'] === $note, 'cap: second pass changes nothing');
+$t(!$dupes($big), 'cap: no duplicate signatures or urgent ids');
+$t(!isset(IrisPublish::capStats()['n']) || IrisPublish::capStats()['n']['cut'] === 0, 'cap: stats show nothing new on the second pass');
+
+$autoload = '/Users/diorti/Documents/codes/rti/fleet-reporter/vendor/autoload.php';
+$haveAutoload = is_file($autoload);
+$t($haveAutoload, 'fleet-reporter autoload exists');
+$valid = static function (array $d) use ($haveAutoload): bool {
+    if (!$haveAutoload) {
+        return false;
+    }
+    $obj = json_decode((string)json_encode($d, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE));
+    return (new \app\services\SchemaValidator())->validate($obj) === [] && (new \app\support\Redactor())->scan($obj) === []
+        && \app\support\Canonical::hash($obj) === $d['payload_hash'];
+};
+if ($haveAutoload) {
+    require_once $autoload;
+}
+$t($valid($big), 'cap: schema, redactor and canonical hash agree');
+
+$noFix = $capDoc();
+unset($noFix['suggested_fixes']);
+$nf = IrisPublish::augment($noFix);
+$t(count($nf['suggested_fixes']) === 200 && $valid($nf), 'cap: 201 urgent rows give exactly 200 fixes');
+$t(!in_array('u-big', array_column($nf['suggested_fixes'], 'issue_ref'), true) && str_contains($nf['result']['flagged_note'], 'kept 200 of 201 fixes'), 'cap: fix for the dropped urgent row is the one left out');
+
+$noId = $sg;
+$noId['urgent'] = [['severity' => 'critical', 'title' => 'No id row', 'count' => 5, 'sites' => ['NNNNN'], 'roles' => ['admin']]];
+$ni = IrisPublish::augment($noId);
+$niId = $ni['urgent'][0]['id'] ?? '';
+$ni2 = IrisPublish::augment($ni);
+$t(count($ni['urgent']) === 1 && preg_match('/^[A-Za-z0-9_.-]{1,64}$/', $niId) === 1 && !preg_match('/\d/', $niId) && ($ni2['urgent'][0]['id'] ?? null) === $niId && $ni2['payload_hash'] === $ni['payload_hash'], 'urgent row without id is kept with a stable digit-free id');
+
+$small = IrisPublish::augment($sg);
+$t($small['artifacts']['tool_report'] === 'report.txt' && !isset($small['result']['flagged_note']) && !isset($small['result']['groups_recorded']) && count($small['top_signatures']) === 1, 'cap: small document unchanged');
+$t(array_key_exists('tool_report', $q['artifacts']) && $q['artifacts']['tool_report'] === null, 'fromRun tool_report is null');
+
+$fat = $capDoc();
+$fat['scope']['sites'] = array_map(fn($i) => sprintf('2%04d', $i), range(0, 19));
+$fat['sites'] = [];
+foreach ($fat['scope']['sites'] as $sid) {
+    $fat['sites'][] = ['site_id' => $sid, 'roles_total' => 0, 'roles_ok' => 0, 'errors' => 0, 'warnings' => 0, 'roles' => []];
+}
+foreach ($fat['top_signatures'] as $i => $sig) {
+    $fat['top_signatures'][$i]['signature'] = substr(sprintf('row %04d ', $i) . str_repeat('aaaa ', 400), 0, 2000);
+    $fat['top_signatures'][$i]['locations'] = array_map(fn($sid) => $sid . '/admin', $fat['scope']['sites']);
+    $fat['top_signatures'][$i]['count'] = 1000000 - $i;
+}
+$fat['urgent'] = [];
+$fat['sites'][0]['roles'] = [];
+$fatDoc = IrisPublish::augment($fat);
+$t($body($fatDoc) <= $limit && count($fatDoc['top_signatures']) < 500 && count($fatDoc['top_signatures']) > 0, 'size loop: body fits after dropping from the end');
+$t($fatDoc['payload_hash'] === IrisPublish::hash($fatDoc) && $valid($fatDoc), 'size loop: hash and schema hold');
+$t(array_column($fatDoc['top_signatures'], 'rank') === range(1, count($fatDoc['top_signatures'])) && ($fatDoc['result']['groups_recorded'] ?? 0) === 501, 'size loop: ranks renumbered, groups recorded');
+$t(substr_count((string)$fatDoc['result']['flagged_note'], 'Iris caps:') === 1, 'size loop: one note sentence');
+
+// Duplicates inside the top slice must not cost a unique signature its slot.
+$dup = $capDoc();
+$dupRows = [];
+for ($i = 0; $i < 10; $i++) {
+    $dupRows[] = ['rank' => $i + 1, 'count' => 5000, 'level' => 'warning', 'severity' => 'medium', 'locations' => ['11111/admin'], 'signature' => 'dupsig-same'];
+}
+for ($i = 0; $i < 500; $i++) {
+    $dupRows[] = ['rank' => 11 + $i, 'count' => 900 - $i, 'level' => 'warning', 'severity' => 'medium', 'locations' => ['11111/admin'], 'signature' => sprintf('uniq-%04d', $i)];
+}
+$dup['top_signatures'] = $dupRows;
+$dupDoc = IrisPublish::augment($dup);
+$dupSigs = array_column($dupDoc['top_signatures'], 'signature');
+$t(count($dupSigs) === 500 && count(array_keys($dupSigs, 'dupsig-same', true)) === 1, 'dedupe before slice: 500 rows, duplicate once');
+$t(in_array('uniq-0498', $dupSigs, true) && !in_array('uniq-0499', $dupSigs, true) && array_column($dupDoc['top_signatures'], 'rank') === range(1, 500), 'dedupe before slice: ranked-499 unique row kept, ranks renumbered');
+
+// Sites alone over the limit, all four lists empty: the loop must keep dropping from the sites.
+$ov = $capDoc();
+$ov['top_signatures'] = [];
+$ov['urgent'] = [];
+$ov['suggested_fixes'] = [];
+$ov['coverage_gaps'] = [];
+$ov['scope']['sites'] = [];
+$ov['sites'] = [];
+for ($i = 0; $i < 60; $i++) {
+    $sid = sprintf('3%04d', $i);
+    $ov['scope']['sites'][] = $sid;
+    $roles = [];
+    for ($j = 0; $j < 50; $j++) {
+        $roles[] = ['role' => sprintf('role-%02d', $j), 'status' => 'failed', 'duration_seconds' => 1, 'error' => ['detail' => str_repeat('abcd efgh ', 50)]];
+    }
+    $ov['sites'][] = ['site_id' => $sid, 'roles_total' => 50, 'roles_ok' => 0, 'errors' => 0, 'warnings' => 0, 'roles' => $roles];
+}
+$t($body($ov) > $limit, 'oversized sites: input exceeds the limit');
+$ovDoc = IrisPublish::augment($ov);
+$t($body($ovDoc) <= $limit, 'oversized sites: body fits after dropping roles and sites');
+$t($ovDoc['payload_hash'] === IrisPublish::hash($ovDoc), 'oversized sites: payload_hash matches');
+$ovNote = (string)($ovDoc['result']['flagged_note'] ?? '');
+$t(substr_count($ovNote, 'Iris caps:') === 1 && str_contains($ovNote, 'dropped') && str_contains($ovNote, 'roles'), 'oversized sites: one note, counts roles');
+$t($ovDoc['job'] === $ov['job'] && $ovDoc['timing'] === $ov['timing'], 'oversized sites: job and timing untouched');
+
+$cli = escapeshellarg(PHP_BINARY) . ' ' . escapeshellarg(TOOL . '/fleet-log-scan.php');
+$t(str_contains($help, '--iris-republish'), 'help mentions --iris-republish');
+exec($cli . ' --iris-republish /tmp/x.iris.json --region sg 2>&1', $out7, $rc7);
+$t($rc7 === 2 && !str_contains(strtolower(implode("\n", $out7)), 'scanning'), 'republish refuses --region');
+exec($cli . ' --iris-republish /tmp/fls-no-such-file.iris.json 2>&1', $out8, $rc8);
+$t($rc8 === 2, 'republish of a missing file exits 2');
+$outside = sys_get_temp_dir() . '/fls-outside-' . getmypid() . '.iris.json';
+file_put_contents($outside, '{}');
+exec($cli . ' --iris-republish ' . escapeshellarg($outside) . ' 2>&1', $out9, $rc9);
+$t($rc9 === 2, 'republish outside reports exits 2');
+@unlink($outside);
+
 if ($fail) {
     exit(1);
 }

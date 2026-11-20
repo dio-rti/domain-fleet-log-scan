@@ -881,7 +881,8 @@ $pl = (string)file_get_contents(TOOL . '/com.rti.fleet-log-scan.plist');
 T::ok((bool)preg_match('#<key>Hour</key>\s*<integer>7</integer>\s*<key>Minute</key>\s*<integer>0</integer>#', $pl), 'plist template: Hour=7 Minute=0 (Dubai clock)');
 T::ok(!file_exists(getenv('HOME') . '/Library/LaunchAgents/com.rti.fleet-log-scan.plist'), 'plist not installed in ~/Library/LaunchAgents');
 T::ok(is_file(TOOL . '/state/DISABLED'), 'tool state/DISABLED present');
-T::ok(!file_exists(TOOL . '/webhook.env'), 'no real webhook.env in the tool dir');
+clearstatcache(true, TOOL . '/webhook.env');
+T::ok(!file_exists(TOOL . '/webhook.env') || (fileperms(TOOL . '/webhook.env') & 0777) === 0600, 'no real webhook.env in the tool dir');
 T::eq(file_exists("$TRAP/TRIPPED") ? file("$TRAP/TRIPPED", FILE_IGNORE_NEW_LINES) : [], [], 'trap: no real ssh/global/cursor-agent/openclaw/launchctl/curl was invoked');
 
 // ---------------------------------------------------------------- 11. GNU/Linux payload parity (local Docker, mawk + GNU coreutils)

@@ -34,10 +34,38 @@ Usage:
   add --webhook-always                               send the webhook even on a quiet day
   add --iris-publish [--iris-sg <file>]              publish Iris ingest v1 instead of webhook.v1 (default off; quiet days publish too)
   add --iris-summary                                 with --iris-publish, attach a verified grok-4.7-high summary (default off)
+  fleet-log-scan.php --iris-republish <file>         republish a saved *.iris.json with no SSH
 Other: --config <file>  --per-run-ok (live trace only, after Dio approves)  --print-payload-hashes  --lint-payloads
 Fixtures-only: --now <epoch>  --stagger <s>
 Live SSH runs are refused unless config live.enabled is true (needs Dio's OK).
 TXT;
+}
+
+function checkRepublishArgs(array $o): void
+{
+    $clash = $o['mode'] !== null ? ['another mode'] : [];
+    foreach (['site', 'region', 'request_id', 'fixtures', 'iris_publish', 'iris_summary', 'iris_sg', 'dry_run'] as $k) {
+        if (isset($o[$k])) {
+            $clash[] = '--' . str_replace('_', '-', $k);
+        }
+    }
+    if ($clash) {
+        throw new FlsException('--iris-republish cannot be combined with ' . implode(', ', $clash), 2);
+    }
+    if (!str_ends_with($o['republish'], '.iris.json')) {
+        throw new FlsException('--iris-republish needs a *.iris.json file', 2);
+    }
+}
+
+/** The saved file must live inside data_dir/reports. */
+function republishPath(array $cfg, string $file): string
+{
+    $real = realpath($file);
+    $reports = realpath($cfg['data_dir'] . '/reports');
+    if ($real === false || $reports === false || !is_file($real) || !str_starts_with($real, $reports . '/') || !str_ends_with($real, '.iris.json')) {
+        throw new FlsException('--iris-republish file must be an existing *.iris.json inside the reports directory', 2);
+    }
+    return $real;
 }
 
 function parseArgs(array $argv): array
@@ -65,6 +93,7 @@ function parseArgs(array $argv): array
             case '--iris-publish': $o['iris_publish'] = true; break;
             case '--iris-summary': $o['iris_summary'] = true; break;
             case '--iris-sg': $o['iris_sg'] = $need($i); break;
+            case '--iris-republish': $o['republish'] = $need($i); break;
             case '--config': $o['config'] = $need($i); break;
             case '--per-run-ok': $o['per_run_ok'] = true; break;
             case '--now': $o['now_s'] = $need($i); break;
@@ -74,6 +103,10 @@ function parseArgs(array $argv): array
             case '-h': case '--help': $o['mode'] = 'help'; break;
             default: throw new FlsException('unknown argument: ' . preg_replace('/[^\w.:\/-]/', '?', $a), 2);
         }
+    }
+    if (isset($o['republish'])) {
+        checkRepublishArgs($o);
+        $o['mode'] = 'republish';
     }
     if ($o['mode'] === null) {
         throw new FlsException("no mode given\n" . usage(), 2);
@@ -120,6 +153,74 @@ function parseArgs(array $argv): array
     return $o;
 }
 
+const REPORTER_AUTOLOAD = '/Users/diorti/Documents/codes/rti/fleet-reporter/vendor/autoload.php';
+const JSON_FLAGS = JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE;
+
+/** @return list<string> "pointer rule" lines from the reporter's own checks. No values. */
+function republishViolations(array $doc): array
+{
+    $obj = json_decode((string)json_encode($doc, JSON_FLAGS));
+    $out = [];
+    foreach ((new \app\services\SchemaValidator())->validate($obj) as $v) {
+        $out[] = $v['pointer'] . ' ' . $v['rule'];
+    }
+    foreach ((new \app\support\Redactor())->scan($obj) as $h) {
+        $out[] = $h['pointer'] . ' ' . $h['class'];
+    }
+    $hash = $doc['payload_hash'] ?? null;
+    if ($hash !== IrisPublish::hash($doc) || $hash !== \app\support\Canonical::hash($obj)) {
+        $out[] = '/payload_hash hash_mismatch';
+    }
+    if (strlen((string)json_encode($doc, JSON_FLAGS)) > 1048576) {
+        $out[] = '/ too_large';
+    }
+    return $out;
+}
+
+/** 422 body: print "pointer rule" or "pointer class" lines only. */
+function republishRejected(array $res): void
+{
+    $body = json_decode((string)($res['body'] ?? ''), true);
+    if (!is_array($body)) {
+        return;
+    }
+    foreach (['violations' => 'rule', 'hits' => 'class'] as $key => $field) {
+        foreach (is_array($body[$key] ?? null) ? array_slice($body[$key], 0, 100) : [] as $v) {
+            if (is_array($v) && is_string($v['pointer'] ?? null) && is_string($v[$field] ?? null)) {
+                echo $v['pointer'], ' ', $v[$field], "\n";
+            }
+        }
+    }
+}
+
+function republish(array $cfg, string $file): int
+{
+    $doc = json_decode((string)file_get_contents($file), true);
+    if (!is_array($doc) || $doc === [] || array_is_list($doc)) {
+        fwrite(STDERR, "fleet-log-scan: republish file is not a JSON object\n");
+        return 2;
+    }
+    $doc = IrisPublish::augment($doc);
+    if (!is_file(REPORTER_AUTOLOAD)) {
+        fwrite(STDERR, "fleet-log-scan: fleet-reporter autoload not found\n");
+        return 2;
+    }
+    require_once REPORTER_AUTOLOAD;
+    $bad = republishViolations($doc);
+    if ($bad) {
+        echo implode("\n", $bad), "\n";
+        return 2;
+    }
+    $sent = IrisPublish::remember($file, $doc, true);
+    $wh = Webhook::fromEnvFile($cfg['webhook_env']);
+    $res = $wh->postResult($sent);
+    echo $wh->mask($res['status']), "\n";
+    if ($res['code'] === 422) {
+        republishRejected($res);
+    }
+    return $res['code'] >= 200 && $res['code'] < 300 ? 0 : 5;
+}
+
 function main(array $argv): int
 {
     try {
@@ -144,6 +245,9 @@ function main(array $argv): int
         }
         $cfg = Config::load($o['config'] ?? TOOL_DIR . '/config.php', TOOL_DIR);
         $data = $cfg['data_dir'];
+        if ($o['mode'] === 'republish') {
+            $o['republish'] = republishPath($cfg, $o['republish']);
+        }
         foreach (['state', 'state/checkpoints', 'state/groups', 'scratch', 'reports', 'outbox'] as $d) {
             Fs::ensureDir($data . '/' . $d);
         }
@@ -165,6 +269,9 @@ function main(array $argv): int
             return 4;
         }
         try {
+            if ($o['mode'] === 'republish') {
+                return republish($cfg, $o['republish']);
+            }
             $r = new Runner($cfg, $o);
             return $o['mode'] === 'trace' ? $r->trace() : $r->scan();
         } finally {
