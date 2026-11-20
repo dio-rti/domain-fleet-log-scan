@@ -122,7 +122,8 @@ $t(preg_match('/^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}$/', $s['job']['run_id']) === 1, 
 $t($s['job']['executor'] === 'cursor' && !isset($s['job']['model']), 'executor set, model absent');
 $t($s['safety']['summary_model_used'] === false, 'digest summary ok does not mark the model');
 $t($s['timing']['timezone_note'] === 'Human clock is Asia/Manila.', 'timezone note stays Manila');
-$t($s['scope']['window']['hours'] === 24 && $s['config']['connect_timeout_seconds'] === 15 && $s['config']['total_timeout_seconds'] === 120, 'window and timeouts filled');
+// window.hours is a float now (24.0), so compare numerically instead of === 24.
+$t((float)$s['scope']['window']['hours'] === 24.0 && $s['config']['connect_timeout_seconds'] === 15 && $s['config']['total_timeout_seconds'] === 120, 'window and timeouts filled');
 $gap = $s['coverage_gaps'][0];
 $t($gap['type'] === 'timeout' && $gap['note'] === 'Read timed out on 11050/db, 11100/db.' && $gap['roles'] === ['11050/db', '11100/db'], 'db timeout gap note is the site/role list');
 $db = null;
@@ -438,6 +439,40 @@ $ovNote = (string)($ovDoc['result']['flagged_note'] ?? '');
 $t(substr_count($ovNote, 'Iris caps:') === 1 && str_contains($ovNote, 'dropped') && str_contains($ovNote, 'roles'), 'oversized sites: one note, counts roles');
 $t($ovDoc['job'] === $ov['job'] && $ovDoc['timing'] === $ov['timing'], 'oversized sites: job and timing untouched');
 
+// ---------------------------------------------------------------- groups-only run (no flags, no failures)
+$gfix = [
+    'run_id' => '20261120T100000Z-aaaaaaaa', 'mode' => 'daily', 'started' => 1795140900, 'servers' => 2,
+    'flags' => [], 'failures' => [], 'window_hours' => 1.441,
+    'scans' => [['site' => '11050', 'role' => 'admin', 'status' => 'ok', 'duration' => 2.0, 'checkpoint_saved' => true], ['site' => '11080', 'role' => 'db', 'status' => 'ok', 'duration' => 3.0, 'checkpoint_saved' => true]],
+    'groups' => [
+        ['site' => '11050', 'role' => 'admin', 'level' => 'error', 'category' => 'c', 'template' => 'Connection refused', 'count' => 7, 'fatal' => false],
+        ['site' => '11080', 'role' => 'db', 'level' => 'error', 'category' => 'c', 'template' => 'Connection refused', 'count' => 5, 'fatal' => false],
+        ['site' => '11050', 'role' => 'admin', 'level' => 'warning', 'category' => 'c', 'template' => 'Slow query', 'count' => 3, 'fatal' => false],
+        ['site' => '11080', 'role' => 'db', 'level' => 'fatal', 'category' => 'c', 'template' => 'Out of memory', 'count' => 2, 'fatal' => true],
+    ],
+];
+$gd = IrisPublish::fromRun($gfix, [], 1795141000);
+$gEvents = 7 + 5 + 3 + 2;
+$t(count($gd['top_signatures']) === 3, 'groups-only: signature count ' . count($gd['top_signatures']));
+$gCounts = array_column($gd['top_signatures'], 'count');
+rsort($gCounts);
+$t($gCounts === [12, 3, 2], 'groups-only: summed counts ' . implode(',', $gCounts));
+$t($gd['scope']['window']['hours'] === 1.441, 'groups-only: window hours');
+$t($gd['urgent'] === [], 'groups-only: urgent empty');
+$t($gd['totals']['errors'] + $gd['totals']['warnings'] + $gd['totals']['fatals'] === $gEvents, 'groups-only: totals');
+$gSite = 0;
+foreach ($gd['sites'] as $site) {
+    $gSite += $site['errors'] + $site['warnings'];
+}
+$t($gSite === $gEvents, 'groups-only: site sums ' . $gSite);
+$t($gd['config']['first_run_hours'] === 24, 'groups-only: first_run_hours');
+$t($gd['result']['flagged_new_groups'] === 0, 'groups-only: flagged_new_groups');
+if ($haveAutoload) {
+    $gobj = json_decode((string)json_encode($gd, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE));
+    $gv = count((new \app\services\SchemaValidator())->validate($gobj)) + count((new \app\support\Redactor())->scan($gobj));
+    $t($gv === 0, "groups-only: violations $gv");
+}
+
 // ---------------------------------------------------------------- replay of saved reports (read-only, counts only)
 $replayRead = static function (string $rid): ?array {
     $path = TOOL . '/reports/' . $rid . '.txt';
@@ -476,28 +511,41 @@ $replayRead = static function (string $rid): ?array {
                 $run['notes'][] = trim($line);
             }
         } elseif ($sec === 'table' && preg_match('/^  (\d{5}) (\S+)\s+(\S+)\s+(\d+)\s+(\S*) "(.*)"$/', $line, $m)) {
-            $table[] = ['site' => $m[1], 'role' => $m[2], 'level' => $m[3], 'count' => (int)$m[4], 'category' => $m[5], 'template' => $m[6]];
+            $table[] = ['site' => $m[1], 'role' => $m[2], 'level' => $m[3], 'category' => $m[5], 'template' => $m[6], 'count' => (int)$m[4], 'fatal' => \Fls\Diff::isFatal($m[3], $m[5], $m[6])];
         }
     }
+    $run['groups'] = $table;
     $run['servers'] = count($run['scans']);
     $durMax = $run['scans'] ? (int)ceil(max(array_column($run['scans'], 'duration'))) : 0;
     return ['run' => $run, 'table' => $table, 'now' => $started + $durMax + 5, 'capped' => count($run['notes'])];
 };
+// label, run, prev, families, events, urgent, window hours (null = first run, publishes 24)
 $replays = [
-    ['20261120T082008Z-f3eaa0af', 'sg', 30],
-    ['20261120T095002Z-b0e2308a', 'vertex', 25],
-    ['20261120T094624Z-1428fce0', 'sg-live', 5],
-    ['20261120T094147Z-0c611166', 'jp', 60],
+    ['sg', '20261120T082008Z-f3eaa0af', null, 40, 21547, 29],
+    ['vertex', '20261120T095002Z-b0e2308a', null, 36, 20345, 22],
+    ['sg-live', '20261120T094624Z-1428fce0', '20261120T082008Z-f3eaa0af', 15, 708, 4],
+    ['jp', '20261120T094147Z-0c611166', null, 56, 262830, 16],
+    ['jp-eve', '20261120T114554Z-2b1f925a', '20261120T094147Z-0c611166', 24, 36790, 6],
+    ['sg-eve', '20261120T114900Z-c343d82e', '20261120T094624Z-1428fce0', 11, 854, 3],
+    ['vx-eve', '20261120T115228Z-9a53a879', '20261120T095002Z-b0e2308a', 16, 1450, 1],
 ];
+$ridEpoch = static fn(string $rid): int => (int)\DateTimeImmutable::createFromFormat('Ymd\THis\Z', substr($rid, 0, 16), new \DateTimeZone('UTC'))->getTimestamp();
+$evening = ['jp-eve', 'sg-eve', 'vx-eve'];
+$replayExtra = ['jp' => 2, 'sg' => 1, 'jp-eve' => 1, 'sg-eve' => 1, 'vx-eve' => 1];
 $jpIds = ['10030', '10531', '10541', '10681', '10684', '10687'];
 $replaySkipped = 0;
-$replayChecksEach = 8; // assertions per replay (JP has two more)
-foreach ($replays as [$rid, $label, $maxFamilies]) {
+$replayChecksEach = 14; // assertions per replay; $replayExtra adds the label-specific ones
+foreach ($replays as [$label, $rid, $prev, $wantFamilies, $wantEvents, $wantUrgent]) {
     // reports/ is gitignored and fleet-reporter is a sibling checkout: absent means skip, present is asserted fully.
     $in = $haveAutoload ? $replayRead($rid) : null;
     if ($in === null) {
-        $replaySkipped += $replayChecksEach + ($label === 'jp' ? 2 : 0);
+        $replaySkipped += $replayChecksEach + ($replayExtra[$label] ?? 0);
         continue;
+    }
+    $wantWindow = 24.0;
+    if ($prev !== null) {
+        $wantWindow = round(($ridEpoch($rid) - $ridEpoch($prev)) / 3600, 3);
+        $in['run']['window_hours'] = $wantWindow;
     }
     $doc = IrisPublish::fromRun($in['run'], [], $in['now']);
     $stats = IrisPublish::capStats();
@@ -508,13 +556,33 @@ foreach ($replays as [$rid, $label, $maxFamilies]) {
     }
     $families = count($sigs);
     if ($label === 'jp') {
-        $keys = [];
-        foreach ($in['table'] as $r) {
-            $keys[$r['level'] . "\n" . \Fls\Family::normalize($r['template'])] = true;
-        }
-        $t(count($keys) > 0 && count($keys) <= $maxFamilies, "replay $label: group-table families " . count($keys) . " <= $maxFamilies");
+        $t($families >= 52 && $families <= 60, "replay $label: signature count $families within 52..60");
     }
-    $t($families > 0 && $families <= $maxFamilies, "replay $label: flag families $families <= $maxFamilies");
+    $t($families === $wantFamilies, "replay $label: signature count $families, expected $wantFamilies");
+    $totalEv = $doc['totals']['errors'] + $doc['totals']['warnings'] + $doc['totals']['fatals'];
+    $t($totalEv === $wantEvents, "replay $label: totals events $totalEv, expected $wantEvents");
+    $siteEv = 0;
+    foreach ($doc['sites'] as $site) {
+        $siteEv += $site['errors'] + $site['warnings'];
+    }
+    $t($siteEv === $wantEvents, "replay $label: site events $siteEv, expected $wantEvents");
+    $urgentN = count($doc['urgent']);
+    $t($urgentN === $wantUrgent, "replay $label: urgent $urgentN, expected $wantUrgent");
+    $t($doc['config']['first_run_hours'] === 24, "replay $label: config first_run_hours");
+    $gotWindow = $doc['scope']['window']['hours'];
+    $t((is_int($gotWindow) || is_float($gotWindow)) && (float)$gotWindow === $wantWindow && ($prev !== null || (float)$gotWindow === 24.0) && ($prev === null || (float)$gotWindow !== 24.0), "replay $label: window hours $gotWindow, expected $wantWindow");
+    $badKeys = 0;
+    foreach ($sigs as $sg1) {
+        $badKeys += count(array_diff(array_keys($sg1), ['rank', 'count', 'level', 'severity', 'locations', 'signature']));
+    }
+    $t($badKeys === 0, "replay $label: signature rows with extra keys $badKeys");
+    if ($label === 'sg') {
+        $t($mix['noise'] === 4, "replay $label: noise signatures {$mix['noise']}, expected 4");
+    }
+    if (in_array($label, $evening, true)) {
+        $nonCrit = count(array_filter($doc['urgent'], fn($u) => ($u['severity'] ?? '') !== 'critical'));
+        $t($urgentN === count($in['run']['failures']) && $nonCrit === 0, "replay $label: urgent $urgentN vs failures " . count($in['run']['failures']) . ", non-critical $nonCrit");
+    }
     $t(($stats['kept']['top_signatures'] ?? -1) === ($stats['orig']['top_signatures'] ?? -2) && !str_contains((string)($doc['result']['flagged_note'] ?? ''), 'signatures'), "replay $label: top_signatures not cut by the cap");
     $rows = [];
     foreach ($doc['sites'] as $site) {
@@ -562,8 +630,8 @@ foreach ($replays as [$rid, $label, $maxFamilies]) {
     }
     $t($viol === 0 && $hashOk && $bodyOk, "replay $label: violations $viol, hash " . ($hashOk ? 'ok' : 'bad') . ', body ' . ($bodyOk ? 'ok' : 'big'));
     echo sprintf(
-        "replay %s: families=%d urgent=%d sev[critical=%d high=%d medium=%d] noise=%d role_rows=%d duration_mismatches=%d byte_cap_gaps=%d violations=%d\n",
-        $label, $families, count($doc['urgent']), $mix['critical'], $mix['high'], $mix['medium'], $mix['noise'], count($rows), $mismatch, count($byteGaps), $viol
+        "replay %s: families=%d events=%d urgent=%d window_hours=%s sev[critical=%d high=%d medium=%d] noise=%d role_rows=%d duration_mismatches=%d byte_cap_gaps=%d violations=%d\n",
+        $label, $families, $totalEv, count($doc['urgent']), (string)$gotWindow, $mix['critical'], $mix['high'], $mix['medium'], $mix['noise'], count($rows), $mismatch, count($byteGaps), $viol
     );
 }
 

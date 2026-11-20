@@ -969,6 +969,9 @@ $rec2 = GroupHistory::record($rec, $nowH + 86400, ['admin' => 24.0], [$obsOf('ad
 $after = Diff::evaluate('10010', $rec2, [$obsOf('admin', 'Genuinely new family')], $nowH + 2 * 86400, $cfgD, $kh0);
 T::ok(count($after['flags']) === 1 && count(array_filter($rec2['groups'], fn($g) => $g['role'] === 'db')) >= 1, 'once the role itself is recorded it diffs (flags ' . count($after['flags']) . ')');
 T::ok(!str_contains(json_encode($rec2), 'raw_template'), 'history never stores raw_template');
+$shortWin = ['hours' => 0.5] + $obsOf('db', 'Genuinely new family', 10);
+$sw = Diff::evaluate('10010', $rec, [$shortWin], $nowH + 86400, $cfgD, $kh0);
+T::ok(count($sw['flags']) === 1 && (float)$sw['flags'][0]['rate'] === 20.0, 'a new group with count 10 over 0.5 h has rate ' . ($sw['flags'][0]['rate'] ?? 'none'));
 
 T::section('severity: isFatal and Iris families');
 T::ok(!Diff::isFatal('error', 'yii\\db\\Exception', 'Fork child failed in {file}') && !Diff::isFatal('error', 'yii\\base\\ErrorException:8', 'Undefined array key {key}') && !Diff::isFatal('error', 'application', 'plain error'), 'plain error, undefined key and fork child are not fatal');

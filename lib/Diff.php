@@ -64,7 +64,7 @@ final class Diff
             $g = $history['groups'][$id] ?? null;
             $seen = $g !== null && (int)($g['last_seen'] ?? 0) >= $now - (int)$d['history_days'] * 86400;
             $harmless = $kh->match($site, $o['class'], $o['level'], $o['category'], (string)($o['raw_template'] ?? $o['template']));
-            $rate = $o['count'] / max(1.0, (float)$o['hours']);
+            $rate = $o['count'] / max(1/3600, (float)$o['hours']);
             if (!$seen) {
                 if ($harmless !== null) {
                     continue;
@@ -82,7 +82,7 @@ final class Diff
             }
             $factor = $rate / $med;
             if ($factor >= (float)$d['spike_factor'] && $o['count'] >= (int)$d['spike_min_count']) {
-                $flags[] = $o + ['site' => $site, 'flag' => 'spike', 'rate' => $rate, 'usual' => $med * max(1.0, (float)$o['hours']), 'factor' => $factor, 'harmless' => $harmless];
+                $flags[] = $o + ['site' => $site, 'flag' => 'spike', 'rate' => $rate, 'usual' => $med * max(1/3600, (float)$o['hours']), 'factor' => $factor, 'harmless' => $harmless];
             }
         }
         return ['flags' => $flags, 'baseline' => $baseline, 'historyDays' => $hdays];

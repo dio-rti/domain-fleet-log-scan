@@ -93,7 +93,8 @@ final class IrisPublish
         $lvl = static fn($l) => in_array($l, ['error', 'warning', 'fatal'], true) ? $l : 'error';
         $totalTimeout = (int)($run['total_timeout'] ?? $opt['total_timeout'] ?? 120);
         $connectTimeout = (int)($run['connect_timeout'] ?? $opt['connect_timeout'] ?? 15);
-        $windowHours = (int)($run['window_hours'] ?? $opt['window_hours'] ?? 24);
+        $windowHours = round((float)($run['window_hours'] ?? $opt['window_hours'] ?? 24), 3);
+        $firstRun = (int)($run['first_run_hours'] ?? 24);
 
         $roleRows = [];
         $sitesSeen = [];
@@ -149,6 +150,8 @@ final class IrisPublish
         }
         $sigs = [];
         $urgent = [];
+        $siteSums = null;
+        $hasGroups = array_key_exists('groups', $run) && is_array($run['groups']);
         foreach ($groups as $g) {
             $breakdown = [];
             $sum = 0;
@@ -196,6 +199,57 @@ final class IrisPublish
                 $row['detail'] = $detail;
             }
             $urgent[] = $row;
+        }
+        if ($hasGroups) {
+            // The full group table drives signatures, totals and per-site sums; urgent stays flag-based.
+            $flagFam = [];
+            foreach ($flags as $f) {
+                if (($f['flag'] ?? '') === 'spike') {
+                    $flagFam[$lvl($f['level'] ?? '') . "\n" . Family::normalize((string)$f['template'])] = true;
+                }
+            }
+            $totals = ['errors' => 0, 'warnings' => 0, 'fatals' => 0, 'http_500_bursts' => 0];
+            $siteSums = [];
+            $gg = [];
+            foreach ($run['groups'] as $r) {
+                if (!is_array($r)) {
+                    continue;
+                }
+                $site = (string)($r['site'] ?? '');
+                $role = (string)($r['role'] ?? '');
+                $note($site, $role);
+                $l = $lvl($r['level'] ?? '');
+                $count = (int)($r['count'] ?? 0);
+                $tpl = (string)($r['template'] ?? '');
+                $totals[$l === 'fatal' ? 'fatals' : ($l === 'warning' ? 'warnings' : 'errors')] += $count;
+                if ($site !== '' && $site !== '-') {
+                    $siteSums[$site][$l === 'warning' ? 'w' : 'e'] = ($siteSums[$site][$l === 'warning' ? 'w' : 'e'] ?? 0) + $count;
+                }
+                $sig = Family::normalize($tpl);
+                $key = $l . "\n" . $sig;
+                if (!isset($gg[$key])) {
+                    $gg[$key] = ['template' => $sig, 'level' => $l, 'fatal' => false, 'count' => 0, 'locs' => []];
+                }
+                $isFatal = isset($r['fatal']) ? (bool)$r['fatal'] : Diff::isFatal($l, (string)($r['category'] ?? ''), $tpl);
+                $gg[$key]['fatal'] = $gg[$key]['fatal'] || $isFatal;
+                $gg[$key]['count'] += $count;
+                if ($site !== '' && $site !== '-' && $role !== '' && $role !== '-') {
+                    $gg[$key]['locs'][$site . '/' . $role] = true;
+                }
+            }
+            $sigs = [];
+            foreach ($gg as $key => $g) {
+                $spike = isset($flagFam[$key]);
+                $sev = $g['fatal'] ? 'critical' : ($g['level'] === 'warning' ? 'medium' : 'high');
+                $noise = !$g['fatal'] && (str_contains($g['template'], 'Unable to resolve the request {path}')
+                    || (str_contains($g['template'], 'command_id={id}') && !$spike));
+                $sigs[] = [
+                    'count' => $g['count'], 'level' => $g['level'],
+                    'severity' => $noise ? 'noise' : $sev,
+                    'locations' => $g['locs'] ? array_map('strval', array_keys($g['locs'])) : ['unknown/admin'],
+                    'signature' => $g['template'],
+                ];
+            }
         }
         usort($sigs, fn($a, $b) => $b['count'] <=> $a['count']);
         $sigRank = [];
@@ -301,9 +355,14 @@ final class IrisPublish
             $ok = count(array_filter($rows, fn($r) => $r['status'] === 'ok'));
             $failedRoles += count($rows) - $ok;
             $e = $w = 0;
-            foreach ($flags as $f) {
-                if ((string)$f['site'] === (string)$sid) {
-                    $f['level'] === 'warning' ? $w += (int)$f['count'] : $e += (int)$f['count'];
+            if ($siteSums !== null) {
+                $e = (int)($siteSums[$sid]['e'] ?? 0);
+                $w = (int)($siteSums[$sid]['w'] ?? 0);
+            } else {
+                foreach ($flags as $f) {
+                    if ((string)$f['site'] === (string)$sid) {
+                        $f['level'] === 'warning' ? $w += (int)$f['count'] : $e += (int)$f['count'];
+                    }
                 }
             }
             $sites[] = ['site_id' => (string)$sid, 'roles_total' => count($rows), 'roles_ok' => $ok, 'errors' => $e, 'warnings' => $w, 'roles' => $rows];
@@ -355,7 +414,7 @@ final class IrisPublish
                 'connect_timeout_seconds' => $connectTimeout,
                 'total_timeout_seconds' => $totalTimeout,
                 'byte_cap_mb_per_file' => 0,
-                'first_run_hours' => $windowHours,
+                'first_run_hours' => $firstRun,
             ],
             'safety' => [
                 'live_enabled_after_run' => false, 'state_disabled_present' => false, 'webhook_env_present' => false,

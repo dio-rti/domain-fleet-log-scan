@@ -201,6 +201,7 @@ final class Runner
         $baselineSites = [];
         $baselineGroups = 0;
         $groupTable = [];
+        $priorHours = [];
         $kh = KnownHarmless::load($cfg);
         $bySite = [];
         $advanced = [];
@@ -232,7 +233,13 @@ final class Runner
                     $notes[] = $site . ' ' . $role . ' server UTC offset ' . $t->header['offset'] . ' (expected +0900 KST)';
                 }
                 $last = GroupHistory::lastRunEpoch($hist[$site], $role);
-                $hours = $last === null ? (float)$cfg['first_run_hours'] : max(1.0, min(192.0, ($this->now - $last) / 3600));
+                if ($last === null) {
+                    $hours = (float)$cfg['first_run_hours'];
+                } else {
+                    $e = min(192.0, ($this->now - $last) / 3600);
+                    $hours = max(0.001, round($e, 3));
+                    $priorHours[] = $hours;
+                }
                 $roleHours[$role] = round($hours, 3);
                 foreach ($t->files as $label => $f) {
                     if (!$f['readable']) {
@@ -330,11 +337,20 @@ final class Runner
             $failures[] = ['site' => '-', 'role' => '-', 'status' => 'site list partial'];
         }
         $sourceProblem = $listPartial || (bool)array_filter($notes, fn($n) => str_starts_with($n, 'site list: global CLI') && str_contains($n, 'include list'));
+        $windowHours = $priorHours ? round(max($priorHours), 3) : (float)$cfg['first_run_hours'];
+        $runGroups = [];
+        foreach ($groupTable as $gr) {
+            $runGroups[] = [
+                'site' => $gr['site'], 'role' => $gr['role'], 'level' => $gr['level'], 'category' => $gr['category'],
+                'template' => $gr['template'], 'count' => $gr['count'],
+                'fatal' => Diff::isFatal((string)$gr['level'], (string)$gr['category'], (string)($gr['raw_template'] ?? $gr['template'])),
+            ];
+        }
         $run = [
             'run_id' => $this->runId, 'mode' => $this->opt['mode'], 'started' => $this->now, 'servers' => $serverCount,
             'flags' => $flags, 'failures' => $failures, 'scans' => $scans, 'quiet' => $quiet, 'observations' => $observations, 'notes' => array_values(array_unique($notes)),
             'connect_timeout' => (int)$cfg['timeouts']['connect'], 'total_timeout' => (int)$cfg['timeouts']['total'],
-            'window_hours' => (int)$cfg['first_run_hours'], 'executor' => 'fleet-log-scan',
+            'window_hours' => $windowHours, 'first_run_hours' => (int)$cfg['first_run_hours'], 'groups' => $runGroups, 'executor' => 'fleet-log-scan',
             'baseline_sites' => $baselineSites, 'baseline_groups' => $baselineGroups,
             'payload_versions' => ['scan-v1.sh' => $phash],
         ];
